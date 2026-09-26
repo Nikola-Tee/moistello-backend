@@ -336,7 +336,6 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "indexer.poll_interval", "3s")
 	setDefault(v, "indexer.batch_size", 50)
 	setDefault(v, "indexer.max_cursor_lag", "2m")
-	setDefault(v, "cors.allowed_origins", []string{"http://localhost:1110"})
 	setDefault(v, "cors.allowed_methods", []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"})
 	setDefault(v, "cors.allowed_headers", []string{"Authorization", "Content-Type", "X-Request-ID"})
 	setDefault(v, "cors.allow_credentials", true)
@@ -390,6 +389,7 @@ func Load(path string) (*Config, error) {
 	mustBindEnv(v, "yellow_card.api_key", "YELLOW_CARD_API_KEY")
 	mustBindEnv(v, "yellow_card.api_secret", "YELLOW_CARD_API_SECRET")
 	mustBindEnv(v, "yellow_card.webhook_secret", "YELLOW_CARD_WEBHOOK_SECRET")
+	mustBindEnv(v, "cors.allowed_origins", "MOISTELLO_CORS_ALLOWED_ORIGINS", "ALLOWED_ORIGINS")
 	v.SetDefault("server.port", 1100)
 	v.SetDefault("server.host", "0.0.0.0")
 	v.SetDefault("server.read_timeout", "10s")
@@ -426,7 +426,6 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("indexer.poll_interval", "3s")
 	v.SetDefault("indexer.batch_size", 50)
 	v.SetDefault("indexer.max_cursor_lag", "2m")
-	v.SetDefault("cors.allowed_origins", []string{"http://localhost:1110"})
 	v.SetDefault("cors.allowed_methods", []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"})
 	v.SetDefault("cors.allowed_headers", []string{"Authorization", "Content-Type", "X-Request-ID"})
 	v.SetDefault("cors.allow_credentials", true)
@@ -483,6 +482,11 @@ func Load(path string) (*Config, error) {
 	if cfg.Environment != "development" && strings.Contains(cfg.Database.URL, "sslmode=disable") {
 		panic(fmt.Errorf("database.url must not use sslmode=disable outside development; use sslmode=require or stronger"))
 	}
+
+	// CORS policy is environment specific (#348): resolve the allowed origins
+	// and refuse combinations that would silently break the browser handshake.
+	cfg.CORS.AllowedOrigins = ResolveCORSAllowedOrigins(cfg.CORS.AllowedOrigins, cfg.Environment)
+	validateCORS(cfg.Environment, cfg.CORS)
 
 	cfg.Hot = NewHotReloader(&cfg)
 
