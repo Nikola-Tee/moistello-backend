@@ -41,6 +41,18 @@ func (c *CursorTracker) GetCurrent(ctx context.Context) (*Cursor, error) {
 	return &cursor, nil
 }
 
+// Rewind moves the cursor backwards to lastLedger. Update deliberately only
+// advances the cursor, so a reorg rollback needs this separate path (#346).
+func (c *CursorTracker) Rewind(ctx context.Context, lastLedger int64) error {
+	_, err := c.db.ExecContext(ctx,
+		"UPDATE indexer_cursor SET last_ledger = $1, last_processed_at = $2 WHERE chain = 'stellar'",
+		lastLedger, time.Now())
+	if err != nil {
+		return fmt.Errorf("rewinding cursor: %w", err)
+	}
+	return nil
+}
+
 // Update writes the new cursor position after successful processing.
 // It is parallel-safe: it only advances the cursor if lastLedger > current last_ledger.
 func (c *CursorTracker) Update(ctx context.Context, lastLedger int64) error {

@@ -14,6 +14,10 @@ import (
 	"github.com/moistello/backend/pkg/rabbitmq"
 )
 
+// defaultReorgWindow is how many ledgers behind the cursor the reorg check
+// inspects when indexer.reorg_window is not configured (#346).
+const defaultReorgWindow = 10
+
 // Engine is the main indexer orchestrator. It polls Horizon for new ledgers,
 // processes matching transactions, broadcasts via WebSocket, publishes events
 // to RabbitMQ, and periodically reconciles state.
@@ -27,9 +31,14 @@ type Engine struct {
 	processor   *EventProcessor
 	reconciler  *Reconciler
 	dedup       *Deduplicator
-	wg          sync.WaitGroup
-	stopCh      chan struct{}
-	metrics     *IndexerMetrics
+	// history records the hashes of recently indexed ledgers so a reorg can be
+	// detected, and chain applies the resulting rollback (#346).
+	history *LedgerHistory
+	chain   *ChainReconciler
+	rewind  Rewinder
+	wg      sync.WaitGroup
+	stopCh  chan struct{}
+	metrics *IndexerMetrics
 }
 
 // NewEngine creates a new Engine with the given dependencies.
@@ -50,6 +59,12 @@ func NewEngine(
 			processor.SetKnownContracts(poller.ContractIDs())
 		}
 	}
+
+	window := cfg.ReorgWindow
+	if window <= 0 {
+		window = defaultReorgWindow
+	}
+
 	return &Engine{
 		cfg:         cfg,
 		db:          db,
@@ -60,6 +75,9 @@ func NewEngine(
 		processor:   processor,
 		reconciler:  reconciler,
 		dedup:       NewDeduplicator(24 * time.Hour),
+		history:     NewLedgerHistory(window),
+		chain:       &ChainReconciler{Window: window},
+		rewind:      NewPostgresRewinder(db, cursor),
 		stopCh:      make(chan struct{}),
 		metrics:     metrics,
 	}
@@ -120,12 +138,68 @@ func (e *Engine) runPollLoop(ctx context.Context) {
 	}
 }
 
+// checkReorg looks for a reorganization behind the cursor and, when one is
+// found inside the configured window, deletes the events derived from the
+// abandoned branch and rewinds the cursor so the replacement ledgers are
+// replayed from the fork point (#346). It returns the cursor the poll loop
+// should continue from, which differs from the input only after a rewind.
+//
+// An error is returned when the rollback itself fails, or when the reorg
+// reaches past the window: the indexer cannot pick a safe fork point in that
+// case and continuing would compound the inconsistency, so the poll cycle
+// fails loudly instead.
+func (e *Engine) checkReorg(ctx context.Context, cursor *Cursor) (*Cursor, error) {
+	if e.chain == nil || e.history == nil || e.rewind == nil || cursor.LastLedger <= 0 {
+		return cursor, nil
+	}
+
+	plan, err := e.chain.DetectReorg(ctx, e.poller, e.history, cursor.LastLedger)
+	if err != nil {
+		return nil, fmt.Errorf("reorg check: %w", err)
+	}
+	if plan == nil {
+		return cursor, nil
+	}
+
+	deleted, err := e.rewind.DeleteEventsFrom(ctx, plan.ForkLedger)
+	if err != nil {
+		return nil, fmt.Errorf("reorg rollback: %w", err)
+	}
+	if err := e.rewind.Rewind(ctx, plan.LastLedger); err != nil {
+		return nil, fmt.Errorf("reorg rollback: %w", err)
+	}
+
+	// Forget the abandoned branch's hashes so replayed ledgers are recorded
+	// afresh instead of comparing against the branch they replaced.
+	e.history.Truncate(plan.ForkLedger)
+
+	if e.metrics != nil && e.metrics.ReorgsDetected != nil {
+		e.metrics.ReorgsDetected.Inc()
+	}
+
+	log.Warn().
+		Int64("forkLedger", plan.ForkLedger).
+		Int64("rewoundTo", plan.LastLedger).
+		Int64("eventsDeleted", deleted).
+		Msg("reorg rollback complete — replaying from fork point")
+
+	return &Cursor{Chain: cursor.Chain, LastLedger: plan.LastLedger, LastProcessedAt: time.Now()}, nil
+}
+
 func (e *Engine) poll(ctx context.Context) error {
 	cursor, err := e.cursor.GetCurrent(ctx)
 	if err != nil {
 		return fmt.Errorf("reading cursor: %w", err)
 	}
 	e.metrics.CursorLagSeconds.Set(cursor.Lag(time.Now()).Seconds())
+
+	// Reorg check first: if a previously indexed branch was abandoned, the
+	// cursor has to be rolled back before any new ledger is processed,
+	// otherwise the abandoned and replacement events both end up persisted.
+	cursor, err = e.checkReorg(ctx, cursor)
+	if err != nil {
+		return err
+	}
 
 	ledgers, err := e.poller.FetchLedgers(ctx, cursor.LastLedger, e.cfg.BatchSize)
 	if err != nil {
@@ -139,6 +213,12 @@ func (e *Engine) poll(ctx context.Context) error {
 
 	processed := 0
 	for _, ledger := range ledgers {
+		// Record the branch this ledger belongs to so a later reorg that
+		// replaces it can be detected (#346).
+		if e.history != nil {
+			e.history.Record(ledger.Sequence, ledger.Hash)
+		}
+
 		txns, err := e.poller.FetchTransactions(ctx, ledger.Sequence)
 		if err != nil {
 			log.Warn().Err(err).Int64("ledger", ledger.Sequence).Msg("skipping ledger")

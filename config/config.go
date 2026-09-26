@@ -204,6 +204,12 @@ type IndexerConfig struct {
 	// MaxCursorLag is how long the cursor's last_processed_at may trail the
 	// current time before the health server reports the indexer as unhealthy.
 	MaxCursorLag time.Duration `mapstructure:"max_cursor_lag"`
+	// ReorgWindow is how many ledgers behind the cursor the reorg check
+	// inspects, and therefore how deep a reorganization can be detected and
+	// rolled back. Values <= 0 fall back to a 10 ledger default; a reorg
+	// reaching past the window is reported rather than partially repaired
+	// (#346).
+	ReorgWindow int `mapstructure:"reorg_window"`
 }
 
 type NotificationConfig struct {
@@ -336,6 +342,7 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "indexer.poll_interval", "3s")
 	setDefault(v, "indexer.batch_size", 50)
 	setDefault(v, "indexer.max_cursor_lag", "2m")
+	setDefault(v, "indexer.reorg_window", 10)
 	setDefault(v, "cors.allowed_origins", []string{"http://localhost:1110"})
 	setDefault(v, "cors.allowed_methods", []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"})
 	setDefault(v, "cors.allowed_headers", []string{"Authorization", "Content-Type", "X-Request-ID"})
@@ -426,6 +433,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("indexer.poll_interval", "3s")
 	v.SetDefault("indexer.batch_size", 50)
 	v.SetDefault("indexer.max_cursor_lag", "2m")
+	v.SetDefault("indexer.reorg_window", 10)
 	v.SetDefault("cors.allowed_origins", []string{"http://localhost:1110"})
 	v.SetDefault("cors.allowed_methods", []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"})
 	v.SetDefault("cors.allowed_headers", []string{"Authorization", "Content-Type", "X-Request-ID"})
