@@ -12,12 +12,29 @@ import (
 	"github.com/moistello/backend/pkg/apperrors"
 )
 
+// querier is satisfied by both *sqlx.DB and *sqlx.Tx, so a repository can be
+// bound to an in-flight transaction and still share its queries with the
+// non-transactional path.
+type querier interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryxContext(ctx context.Context, query string, args ...interface{}) (*sqlx.Rows, error)
+	QueryRowxContext(ctx context.Context, query string, args ...interface{}) *sqlx.Row
+	NamedExecContext(ctx context.Context, query string, arg interface{}) (sql.Result, error)
+}
+
 type pgRepo struct {
-	db *sqlx.DB
+	db querier
 }
 
 func NewRepository(db *sqlx.DB) Repository {
 	return &pgRepo{db: db}
+}
+
+// NewRepositoryFromTx returns a repository bound to an in-flight transaction,
+// so a payout insert commits or rolls back together with the circle round
+// advance it belongs to.
+func NewRepositoryFromTx(tx *sqlx.Tx) Repository {
+	return &pgRepo{db: tx}
 }
 
 func scanPayout(row interface{ Scan(...interface{}) error }) (*Payout, error) {

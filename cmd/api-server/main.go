@@ -18,6 +18,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,6 +29,7 @@ import (
 	"github.com/moistello/backend/internal/domain/admin"
 	"github.com/moistello/backend/internal/domain/audit"
 	"github.com/moistello/backend/internal/domain/auth"
+	"github.com/moistello/backend/internal/domain/auth/session"
 	"github.com/moistello/backend/internal/domain/chat"
 	"github.com/moistello/backend/internal/domain/circle"
 	"github.com/moistello/backend/internal/domain/community"
@@ -126,6 +129,20 @@ func (a *userLookupAdapter) FindRecipient(ctx context.Context, userID string) (n
 }
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "config-validate" || os.Args[1] == "--config-validate" || (os.Args[1] == "config" && len(os.Args) > 2 && os.Args[2] == "validate")) {
+		cfg, err := config.Load("")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Configuration load failed:\n%v\n", err)
+			os.Exit(1)
+		}
+		if err := cfg.ValidateOffline(); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Configuration offline validation failed:\n%v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✅ Configuration is valid (environment=%s, offline preflight passed)\n", cfg.Environment)
+		os.Exit(0)
+	}
+
 	cfg, err := config.Load("")
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to load configuration")
@@ -204,10 +221,25 @@ func main() {
 	contribSvc := contribution.NewService(contribRepo, wsBroadcaster, contribution.NewTransactor(db), horizonClient, cfg.Stellar.MasterPublicKey, circleSvc)
 	payoutSvc := payout.NewService(payoutRepo, horizonClient, &payoutWalletAdapter{repo: userRepo}, circleSvc)
 	reputationSvc := reputation.NewService(reputationRepo)
-	authSvc, err := auth.NewService(redisClient, cfg.Auth.NonceTTL, cfg.Auth.AccessTokenTTL, cfg.Auth.RefreshTokenTTL, cfg.Auth.JWTPrivateKeyPEM, cfg.Auth.JWTPublicKeyPEM)
+	authSvc, err := auth.NewServiceWithKeyConfig(redisClient, cfg.Auth.NonceTTL, cfg.Auth.AccessTokenTTL, cfg.Auth.RefreshTokenTTL, auth.KeyConfig{
+		CurrentPrivateKeyPEM:  cfg.Auth.JWTPrivateKeyPEM,
+		CurrentPublicKeyPEM:   cfg.Auth.JWTPublicKeyPEM,
+		CurrentKID:            cfg.Auth.JWTCurrentKID,
+		PreviousPrivateKeyPEM: cfg.Auth.JWTPreviousPrivateKeyPEM,
+		PreviousPublicKeyPEM:  cfg.Auth.JWTPreviousPublicKeyPEM,
+		PreviousKID:           cfg.Auth.JWTPreviousKID,
+	})
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize auth service")
 	}
+
+	// Expired-session cleanup (#374). This job is the only thing that reclaims
+	// session state by age — request paths delete sessions by explicit token
+	// hash on logout or revocation and never sweep. Every replica schedules the
+	// job with jitter and contends for a Redis lock, so a tick performs exactly
+	// one sweep across the fleet.
+	sessionCleaner := session.NewCleaner(redisClient, session.NewSessionStore(db), cfg.Auth.CleanupInterval, cfg.Auth.CleanupJitter)
+	sessionCleaner.Start(context.Background())
 
 	totpSvc := totp.NewService()
 	verificationSvc := verification.NewService(redisClient)
@@ -276,6 +308,7 @@ func main() {
 	jwtPublicKey := []byte(cfg.Auth.JWTPublicKeyPEM)
 
 	wsH := handler.NewWebSocketHandler(wsHub, cfg.CORS.AllowedOrigins)
+	go wsHub.StartMembershipAuditor(context.Background(), 30*time.Second)
 
 	authH := handler.NewAuthHandler(authSvc, userSvc, walletSvc, totpSvc, verificationSvc, emailSvc, redisClient, userRepo)
 	userH := handler.NewUserHandler(userSvc)
@@ -284,7 +317,10 @@ func main() {
 	payoutH := handler.NewPayoutHandler(payoutSvc, payoutRepo)
 	inviteH := handler.NewInviteHandler(inviteSvc)
 	notifH := handler.NewNotificationHandler(notificationSvc, userSvc)
-	adminSvc := admin.NewService(admin.NewRepositoryWithReader(postgres.NewReader(db, replicaDB)), 0)
+	adminSvc, err := admin.NewService(admin.NewRepositoryWithReader(postgres.NewReader(db, replicaDB)), 0)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to initialize admin metrics service")
+	}
 	featureFlagRepo := featureflag.NewRepository(db)
 	featureFlagSvc := featureflag.NewService(featureFlagRepo)
 	featureFlagCache := featureflag.NewCache(featureFlagSvc, featureflag.DefaultReloadInterval)
@@ -354,6 +390,22 @@ func main() {
 	mmSvc := mobilemoney.NewService(mmRepo, mmRegistry)
 	mobileMoneyH := handler.NewMobileMoneyHandler(mmSvc, walletSvc)
 
+	// Startup provider-presence probe and logging (#412)
+	activeProviders := mmRegistry.ActiveProviderNames()
+	if len(activeProviders) > 0 {
+		log.Info().
+			Strs("active_providers", activeProviders).
+			Strs("supported_currencies", mmRegistry.SupportedCurrencies()).
+			Msg("mobile money providers initialized")
+	} else {
+		isDev := cfg.Environment == "development" || cfg.Environment == "dev" || cfg.Environment == "test"
+		if !isDev {
+			log.Error().Msg("zero mobile money providers configured in non-development environment")
+		} else {
+			log.Warn().Msg("no mobile money providers configured")
+		}
+	}
+
 	// E2EE chat (#188): X3DH key bundles + encrypted message store on top
 	// of the crypto primitives in internal/domain/chat/x3dh.go.
 	chatKeyRepo := chat.NewKeyRepository(db)
@@ -365,24 +417,9 @@ func main() {
 	if reconcileInterval <= 0 {
 		reconcileInterval = 5 * time.Minute
 	}
-	mmReconcileStop := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(reconcileInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				count, err := mmSvc.Reconcile(context.Background())
-				if err != nil {
-					log.Warn().Err(err).Msg("mobile money reconciliation pass failed")
-				} else if count > 0 {
-					log.Info().Int("count", count).Msg("mobile money reconciliation updated pending transactions")
-				}
-			case <-mmReconcileStop:
-				return
-			}
-		}
-	}()
+	// Reconciler with Redis single-flight lock across replicas (#413)
+	mmReconciler := mobilemoney.NewReconciler(redisClient, mmSvc, reconcileInterval, cfg.Auth.CleanupJitter)
+	mmReconciler.Start(context.Background())
 
 	// Savings goals
 	savingsRepo := savings.NewRepository(db)
@@ -424,10 +461,11 @@ func main() {
 		log.Warn().Err(rmqErr).Msg("RabbitMQ unavailable — health checks will report degraded")
 	}
 
-	// Wire RabbitMQ into health handler for /health and /health/ready probes
+	// Wire RabbitMQ and MobileMoney into health handler for /health and /health/ready probes
 	if rmqClient != nil {
 		healthH.WithRabbitMQ(rmqClient)
 	}
+	healthH.WithMobileMoney(mmRegistry)
 
 	// Job queue for background tasks
 	jobQueue := jobqueue.NewJobQueue(db)
@@ -451,8 +489,9 @@ func main() {
 			func(context.Context) { stopPoolMonitor() },
 			func(context.Context) {
 				featureFlagCache.Stop()
-				close(mmReconcileStop)
+				mmReconciler.Stop()
 			},
+			func(context.Context) { sessionCleaner.Stop() },
 		},
 		CloseLast: []func(){
 			func() {

@@ -133,6 +133,12 @@ func TestIndexerMetrics_Creation(t *testing.T) {
 	assert.NotNil(t, m.ReconcilerRuns)
 	assert.NotNil(t, m.DedupSize)
 	assert.NotNil(t, m.CursorLagSeconds)
+	assert.NotNil(t, m.Events)
+	assert.NotNil(t, m.Events.Received)
+	assert.NotNil(t, m.Events.Decoded)
+	assert.NotNil(t, m.Events.Failed)
+	assert.NotNil(t, m.Events.DLQ)
+	assert.NotNil(t, m.Events.DecodeSkipped)
 }
 
 func TestReconciler_StartStop(t *testing.T) {

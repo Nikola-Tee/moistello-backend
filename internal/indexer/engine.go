@@ -46,6 +46,7 @@ func NewEngine(
 	metrics := NewIndexerMetrics()
 	if processor != nil {
 		processor.unknownEvents = metrics.UnknownContractEvents
+		processor.SetEventCounters(metrics.Events)
 		if poller != nil {
 			processor.SetKnownContracts(poller.ContractIDs())
 		}

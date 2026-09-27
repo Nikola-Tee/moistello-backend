@@ -9,6 +9,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -16,13 +17,14 @@ import (
 
 	"github.com/moistello/backend/internal/domain/circle"
 	circleMocks "github.com/moistello/backend/internal/domain/circle/mocks"
+	"github.com/moistello/backend/internal/domain/contribution"
 	contribMocks "github.com/moistello/backend/internal/domain/contribution/mocks"
+	"github.com/moistello/backend/internal/domain/payout"
 	payoutMocks "github.com/moistello/backend/internal/domain/payout/mocks"
 	"github.com/moistello/backend/internal/domain/reputation"
 	reputationMocks "github.com/moistello/backend/internal/domain/reputation/mocks"
 	"github.com/moistello/backend/internal/domain/user"
 	userMocks "github.com/moistello/backend/internal/domain/user/mocks"
-	"github.com/moistello/backend/pkg/apperrors"
 )
 
 // ---------------------------------------------------------------------------
@@ -38,14 +40,34 @@ func newTestProcessor(
 	repRepo *reputationMocks.Repository,
 	userRepo *userMocks.Repository,
 ) *EventProcessor {
+	var cRepo circle.Repository
+	if circleRepo != nil {
+		cRepo = circleRepo
+	}
+	var ctRepo contribution.Repository
+	if contribRepo != nil {
+		ctRepo = contribRepo
+	}
+	var pRepo payout.Repository
+	if payoutRepo != nil {
+		pRepo = payoutRepo
+	}
+	var rRepo reputation.Repository
+	if repRepo != nil {
+		rRepo = repRepo
+	}
+	var uRepo user.Repository
+	if userRepo != nil {
+		uRepo = userRepo
+	}
 	return &EventProcessor{
 		db:             nil, // not needed for dispatch-level tests
 		rmqClient:      nil,
-		circleRepo:     circleRepo,
-		contribRepo:    contribRepo,
-		payoutRepo:     payoutRepo,
-		reputationRepo: repRepo,
-		userRepo:       userRepo,
+		circleRepo:     cRepo,
+		contribRepo:    ctRepo,
+		payoutRepo:     pRepo,
+		reputationRepo: rRepo,
+		userRepo:       uRepo,
 	}
 }
 
@@ -196,8 +218,12 @@ func TestOnContributionReceived_Success(t *testing.T) {
 
 	cRepo.On("FindByContractID", mock.Anything, "cid1").Return(c, nil)
 	uRepo.On("FindByWalletAddress", mock.Anything, "GWALLET1").Return(u, nil)
-	ctRepo.On("Create", mock.Anything, mock.AnythingOfType("*contribution.Contribution")).Return(nil)
-	cRepo.On("Update", mock.Anything, mock.AnythingOfType("*circle.Circle")).Return(nil)
+
+	p, dbm := newTxTestProcessor(t)
+	p.circleRepo = cRepo
+	p.userRepo = uRepo
+	// 1 of 3 active members has contributed, so the round stays where it is.
+	expectContributionTx(dbm, c.ID, contribRoundOne, 50, 1, 3, false)
 
 	ev := contractEvent(EventContributionReceived, "cid1", map[string]any{
 		"circle_id": "cid1",
@@ -208,7 +234,7 @@ func TestOnContributionReceived_Success(t *testing.T) {
 
 	err := p.onContributionReceived(context.Background(), ev)
 	assert.NoError(t, err)
-	ctRepo.AssertCalled(t, "Create", mock.Anything, mock.AnythingOfType("*contribution.Contribution"))
+	assert.NoError(t, dbm.ExpectationsWereMet())
 }
 
 // ---------------------------------------------------------------------------
@@ -226,8 +252,11 @@ func TestOnPayoutExecuted_Success(t *testing.T) {
 
 	cRepo.On("FindByContractID", mock.Anything, "cid1").Return(c, nil)
 	uRepo.On("FindByWalletAddress", mock.Anything, "GWALLET_RECIPIENT").Return(u, nil)
-	pRepo.On("Create", mock.Anything, mock.AnythingOfType("*payout.Payout")).Return(nil)
-	cRepo.On("Update", mock.Anything, mock.AnythingOfType("*circle.Circle")).Return(nil)
+
+	p, dbm := newTxTestProcessor(t)
+	p.circleRepo = cRepo
+	p.userRepo = uRepo
+	expectPayoutTx(dbm, c.ID, 2)
 
 	ev := contractEvent(EventPayoutExecuted, "cid1", map[string]any{
 		"circle_id":   "cid1",
@@ -239,7 +268,7 @@ func TestOnPayoutExecuted_Success(t *testing.T) {
 
 	err := p.onPayoutExecuted(context.Background(), ev)
 	assert.NoError(t, err)
-	pRepo.AssertCalled(t, "Create", mock.Anything, mock.AnythingOfType("*payout.Payout"))
+	assert.NoError(t, dbm.ExpectationsWereMet())
 }
 
 // ---------------------------------------------------------------------------
@@ -599,7 +628,12 @@ func TestOnContributionReceived_Reprocessed_IsNoOp(t *testing.T) {
 
 	cRepo.On("FindByContractID", mock.Anything, "cid1").Return(c, nil)
 	uRepo.On("FindByWalletAddress", mock.Anything, "GWALLET1").Return(u, nil)
-	ctRepo.On("Create", mock.Anything, mock.AnythingOfType("*contribution.Contribution")).Return(apperrors.ErrConflict)
+
+	p, dbm := newTxTestProcessor(t)
+	p.circleRepo = cRepo
+	p.userRepo = uRepo
+	// A unique violation on the insert means this event was already applied.
+	expectContributionConflict(dbm, c.ID)
 
 	ev := contractEvent(EventContributionReceived, "cid1", map[string]any{
 		"circle_id": "cid1",
@@ -610,7 +644,7 @@ func TestOnContributionReceived_Reprocessed_IsNoOp(t *testing.T) {
 
 	assert.NoError(t, p.onContributionReceived(context.Background(), ev))
 	assert.Zero(t, c.TotalContributions, "aggregate must not change on replay")
-	cRepo.AssertNotCalled(t, "Update", mock.Anything, mock.Anything)
+	assert.NoError(t, dbm.ExpectationsWereMet(), "the circle row must never be touched on a replay")
 }
 
 func TestOnPayoutExecuted_Reprocessed_IsNoOp(t *testing.T) {
@@ -625,7 +659,11 @@ func TestOnPayoutExecuted_Reprocessed_IsNoOp(t *testing.T) {
 
 	cRepo.On("FindByContractID", mock.Anything, "cid1").Return(c, nil)
 	uRepo.On("FindByWalletAddress", mock.Anything, "GWALLET_RECIPIENT").Return(u, nil)
-	pRepo.On("Create", mock.Anything, mock.AnythingOfType("*payout.Payout")).Return(apperrors.ErrConflict)
+
+	p, dbm := newTxTestProcessor(t)
+	p.circleRepo = cRepo
+	p.userRepo = uRepo
+	expectPayoutConflict(dbm, c.ID)
 
 	ev := contractEvent(EventPayoutExecuted, "cid1", map[string]any{
 		"circle_id":   "cid1",
@@ -637,7 +675,7 @@ func TestOnPayoutExecuted_Reprocessed_IsNoOp(t *testing.T) {
 
 	assert.NoError(t, p.onPayoutExecuted(context.Background(), ev))
 	assert.Equal(t, 2, c.CurrentRound, "round must not move on replay")
-	cRepo.AssertNotCalled(t, "Update", mock.Anything, mock.Anything)
+	assert.NoError(t, dbm.ExpectationsWereMet(), "the circle row must never be touched on a replay")
 }
 
 func TestOnMemberJoined_Reprocessed_IsNoOp(t *testing.T) {
@@ -681,3 +719,78 @@ func TestEventRecorded(t *testing.T) {
 	assert.False(t, (&EventProcessor{}).eventRecorded(context.Background(), ev), "no database means nothing is recorded")
 	assert.NoError(t, sqlMock.ExpectationsWereMet())
 }
+
+// ---------------------------------------------------------------------------
+// AuctionBid
+// ---------------------------------------------------------------------------
+
+func TestOnAuctionBid_Success(t *testing.T) {
+	cRepo := &circleMocks.Repository{}
+	uRepo := &userMocks.Repository{}
+	p := newTestProcessor(cRepo, nil, nil, nil, uRepo)
+
+	c := testCircle("cid_auction")
+	u := testUser("GWALLET_BIDDER")
+
+	cRepo.On("FindByContractID", mock.Anything, "cid_auction").Return(c, nil)
+	uRepo.On("FindByWalletAddress", mock.Anything, "GWALLET_BIDDER").Return(u, nil)
+	cRepo.On("CreateAuctionBid", mock.Anything, mock.MatchedBy(func(b *circle.CircleAuctionBid) bool {
+		return b.CircleID == c.ID && b.BidderID == u.ID && b.RoundNumber == 2 && b.BidAmount == float64(500)
+	})).Return(nil)
+
+	ev := contractEvent(EventAuctionBid, "cid_auction", map[string]any{
+		"circle_id":     "cid_auction",
+		"bidder":        "GWALLET_BIDDER",
+		"discount_bips": int(500),
+		"round":         int(2),
+	})
+
+	err := p.onAuctionBid(context.Background(), ev)
+	assert.NoError(t, err)
+	cRepo.AssertExpectations(t)
+	uRepo.AssertExpectations(t)
+}
+
+func TestOnAuctionBid_CircleNotFound(t *testing.T) {
+	cRepo := &circleMocks.Repository{}
+	uRepo := &userMocks.Repository{}
+	p := newTestProcessor(cRepo, nil, nil, nil, uRepo)
+
+	cRepo.On("FindByContractID", mock.Anything, "cid_missing").Return(nil, errTestNotFound)
+
+	ev := contractEvent(EventAuctionBid, "cid_missing", map[string]any{
+		"circle_id":     "cid_missing",
+		"bidder":        "GWALLET_BIDDER",
+		"discount_bips": int(500),
+		"round":         int(1),
+	})
+
+	err := p.onAuctionBid(context.Background(), ev)
+	assert.NoError(t, err)
+	cRepo.AssertExpectations(t)
+	uRepo.AssertNotCalled(t, "FindByWalletAddress")
+}
+
+func TestOnAuctionBid_UserNotFound(t *testing.T) {
+	cRepo := &circleMocks.Repository{}
+	uRepo := &userMocks.Repository{}
+	p := newTestProcessor(cRepo, nil, nil, nil, uRepo)
+
+	c := testCircle("cid_auction")
+	cRepo.On("FindByContractID", mock.Anything, "cid_auction").Return(c, nil)
+	uRepo.On("FindByWalletAddress", mock.Anything, "GWALLET_UNKNOWN").Return(nil, errTestNotFound)
+
+	ev := contractEvent(EventAuctionBid, "cid_auction", map[string]any{
+		"circle_id":     "cid_auction",
+		"bidder":        "GWALLET_UNKNOWN",
+		"discount_bips": int(500),
+		"round":         int(1),
+	})
+
+	err := p.onAuctionBid(context.Background(), ev)
+	assert.NoError(t, err)
+	cRepo.AssertExpectations(t)
+	uRepo.AssertExpectations(t)
+	cRepo.AssertNotCalled(t, "CreateAuctionBid")
+}
+
