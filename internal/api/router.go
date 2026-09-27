@@ -63,6 +63,7 @@ func NewRouter(
 	referralHandler *handler.ReferralHandler,
 	consentHandler *handler.ConsentHandler,
 	adminJobQueueHandler *handler.AdminJobQueueHandler,
+	adminIndexerHandler *handler.AdminIndexerHandler,
 	webhookRepo webhook.WebhookRepository,
 	yellowCardWebhookHandler *handler.YellowCardWebhookHandler,
 	jwtPublicKey []byte,
@@ -309,6 +310,10 @@ func NewRouter(
 		admin.Use(middleware.AdminMiddleware())
 		{
 			admin.GET("/users", adminHandler.ListUsers)
+		// Registered before any /users/:id route so the static "deleted" segment
+		// is not captured by a wildcard parameter.
+		admin.GET("/users/deleted", adminHandler.ListDeletedUsers)
+		admin.POST("/users/:id/restore", adminHandler.RestoreUser)
 			admin.GET("/circles", adminHandler.ListCircles)
 			admin.GET("/circles/:id/inspect", adminHandler.InspectCircleState)
 			admin.GET("/audit-log", adminHandler.GetAuditLog)
@@ -319,6 +324,8 @@ func NewRouter(
 			admin.DELETE("/feature-flags/:flag", adminHandler.DeleteFeatureFlag)
 			admin.GET("/jobs/dead-letter", adminJobQueueHandler.GetDeadLetterJobs)
 			admin.POST("/jobs/dead-letter/:id/retry", adminJobQueueHandler.RetryDeadLetterJob)
+			admin.GET("/indexer/dead-letter", adminIndexerHandler.GetDeadLetterEvents)
+			admin.POST("/indexer/dead-letter/:id/resolve", adminIndexerHandler.ResolveDeadLetterEvent)
 		}
 
 		optional := api.Group("")

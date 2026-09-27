@@ -98,7 +98,7 @@ func main() {
 	reconciler := indexer.NewReconciler(
 		cursor, poller, processor,
 		indexer.NewDeduplicator(24*time.Hour),
-	)
+	).WithDeadLetters(indexer.NewDeadLetterStore(db))
 
 	engine := indexer.NewEngine(
 		cfg.Indexer,
