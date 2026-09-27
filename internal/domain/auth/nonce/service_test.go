@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"testing"
 	"time"
 
@@ -238,6 +237,7 @@ func TestNonceBasicFlow(t *testing.T) {
 		// Generate nonce
 		nonce, err := svc.Generate(ctx, walletAddress)
 		require.NoError(t, err)
+		require.NotEmpty(t, nonce.Nonce)
 
 		// Create wrong signature (sign wrong data)
 		wrongMessage := sha256.Sum256([]byte("wrong"))

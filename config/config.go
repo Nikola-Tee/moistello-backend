@@ -177,6 +177,14 @@ type AuthConfig struct {
 	RefreshTokenTTL   time.Duration `mapstructure:"refresh_token_ttl"`
 	NonceTTL          time.Duration `mapstructure:"nonce_ttl"`
 	AdminAPIKey       string        `mapstructure:"admin_api_key"`
+	// CleanupInterval is how often the scheduled session cleanup job runs
+	// (#374). It is the only thing that reclaims expired session state; no
+	// request path sweeps.
+	CleanupInterval time.Duration `mapstructure:"cleanup_interval"`
+	// CleanupJitter is the upper bound of the random delay applied before each
+	// sweep attempt, so replicas do not contend for the cleanup lock in
+	// lockstep.
+	CleanupJitter time.Duration `mapstructure:"cleanup_jitter"`
 }
 
 type SecurityConfig struct {
@@ -325,6 +333,8 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "auth.access_token_ttl", "15m")
 	setDefault(v, "auth.refresh_token_ttl", "168h")
 	setDefault(v, "auth.nonce_ttl", "5m")
+	setDefault(v, "auth.cleanup_interval", "5m")
+	setDefault(v, "auth.cleanup_jitter", "30s")
 	setDefault(v, "auth.jwt_private_key_path", "./config/keys/jwt-private.pem")
 	setDefault(v, "auth.jwt_public_key_path", "./config/keys/jwt-public.pem")
 	setDefault(v, "security.argon2_time", 1)
@@ -420,6 +430,8 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("auth.access_token_ttl", "15m")
 	v.SetDefault("auth.refresh_token_ttl", "168h")
 	v.SetDefault("auth.nonce_ttl", "5m")
+	v.SetDefault("auth.cleanup_interval", "5m")
+	v.SetDefault("auth.cleanup_jitter", "30s")
 	v.SetDefault("brevo.api_key", "")
 	v.SetDefault("brevo.from_email", "noreply@moistello.com")
 	v.SetDefault("brevo.from_name", "Moistello")

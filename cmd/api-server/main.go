@@ -27,6 +27,7 @@ import (
 	"github.com/moistello/backend/internal/domain/admin"
 	"github.com/moistello/backend/internal/domain/audit"
 	"github.com/moistello/backend/internal/domain/auth"
+	"github.com/moistello/backend/internal/domain/auth/session"
 	"github.com/moistello/backend/internal/domain/chat"
 	"github.com/moistello/backend/internal/domain/circle"
 	"github.com/moistello/backend/internal/domain/community"
@@ -208,6 +209,14 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize auth service")
 	}
+
+	// Expired-session cleanup (#374). This job is the only thing that reclaims
+	// session state by age — request paths delete sessions by explicit token
+	// hash on logout or revocation and never sweep. Every replica schedules the
+	// job with jitter and contends for a Redis lock, so a tick performs exactly
+	// one sweep across the fleet.
+	sessionCleaner := session.NewCleaner(redisClient, session.NewSessionStore(db), cfg.Auth.CleanupInterval, cfg.Auth.CleanupJitter)
+	sessionCleaner.Start(context.Background())
 
 	totpSvc := totp.NewService()
 	verificationSvc := verification.NewService(redisClient)
@@ -456,6 +465,7 @@ func main() {
 				featureFlagCache.Stop()
 				close(mmReconcileStop)
 			},
+			func(context.Context) { sessionCleaner.Stop() },
 		},
 		CloseLast: []func(){
 			func() {

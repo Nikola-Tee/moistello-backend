@@ -30,6 +30,10 @@ func (s *stubCircleService) Get(_ context.Context, id string) (*circle.Circle, e
 	return s.circle, nil
 }
 
+func (s *stubCircleService) QueryRoundConfig(_ context.Context, _ string, _ int) (*circle.RoundConfigSnapshot, error) {
+	return nil, nil
+}
+
 type stubContribService struct {
 	contribution.Service
 	contribs []contribution.Contribution
