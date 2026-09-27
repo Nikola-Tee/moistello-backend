@@ -146,6 +146,17 @@ func (p *EventProcessor) ProcessTransaction(ctx context.Context, txn *Transactio
 	return nil
 }
 
+// txnTime returns the ledger close time for a transaction, falling back to
+// time.Now().UTC() when the close time was not populated (e.g. in tests).
+// This ensures all database timestamps follow ledger sequence ordering
+// rather than wall-clock time (#471).
+func txnTime(txn *Transaction) time.Time {
+	if !txn.LedgerCloseTime.IsZero() {
+		return txn.LedgerCloseTime.UTC()
+	}
+	return time.Now().UTC()
+}
+
 func (p *EventProcessor) processOperation(ctx context.Context, txn *Transaction, op *Operation) error {
 	switch {
 	case op.Type == "create_account":
@@ -174,7 +185,7 @@ func (p *EventProcessor) handleCreateAccount(ctx context.Context, txn *Transacti
 		"hash":    txn.Hash,
 		"account": op.SourceAccount,
 		"ledger":  txn.Ledger,
-	})
+	}, txnTime(txn))
 	return nil
 }
 
@@ -215,7 +226,7 @@ func (p *EventProcessor) handleSorobanInvoke(ctx context.Context, txn *Transacti
 		p.events.DecodeSkipped.WithLabelValues("malformed_event").Add(float64(skipped))
 	}
 
-	p.processContractEvents(ctx, txn.Hash, events)
+	p.processContractEvents(ctx, txn.Hash, events, txnTime(txn))
 	return nil
 }
 
@@ -228,7 +239,10 @@ func (p *EventProcessor) handleSorobanInvoke(ctx context.Context, txn *Transacti
 // what keeps the per-event-type counters complete: every event is counted
 // exactly once here, whatever its type, so a type the indexer has never seen
 // still lands in the counters.
-func (p *EventProcessor) processContractEvents(ctx context.Context, txHash string, events []ContractEvent) {
+func (p *EventProcessor) processContractEvents(ctx context.Context, txHash string, events []ContractEvent, closeTime time.Time) {
+	for i := range events {
+		events[i].LedgerCloseTime = closeTime
+	}
 	for _, ev := range events {
 		if p.isUnknownContract(ev.ContractID) {
 			if p.unknownEvents != nil {
@@ -389,7 +403,7 @@ func (p *EventProcessor) onMemberJoined(ctx context.Context, ev *ContractEvent) 
 		CircleID: c.ID,
 		UserID:   u.ID,
 		Status:   circle.MemberStatusActive,
-		JoinedAt: time.Now().UTC(),
+		JoinedAt: txnTime(txn),
 	}
 	if err := p.circleRepo.CreateMember(ctx, member); err != nil {
 		if errors.Is(err, circle.ErrAlreadyMember) {
@@ -985,7 +999,7 @@ func (p *EventProcessor) onFeeDeposited(ctx context.Context, ev *ContractEvent) 
 			INSERT INTO treasury_fees (circle_id, amount, tx_hash, ledger, created_at)
 			VALUES ($1, $2, $3, $4, $5)
 			ON CONFLICT (tx_hash, circle_id) DO NOTHING`,
-			circleID, amount, ev.TxHash, ev.Ledger, time.Now().UTC(),
+			circleID, amount, ev.TxHash, ev.Ledger, ev.LedgerCloseTime,
 		)
 		if err != nil {
 			log.Warn().Err(err).
@@ -1078,7 +1092,7 @@ func (p *EventProcessor) persistContractEvent(ctx context.Context, ev *ContractE
 		INSERT INTO contract_events (tx_hash, ledger, contract_id, event_type, contract_version, payload, processed_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT DO NOTHING`,
-		ev.TxHash, ev.Ledger, ev.ContractID, ev.EventType, version, payloadJSON, time.Now().UTC(),
+		ev.TxHash, ev.Ledger, ev.ContractID, ev.EventType, version, payloadJSON, ev.LedgerCloseTime,
 	)
 	return err
 }
@@ -1114,7 +1128,7 @@ func (p *EventProcessor) contractVersion(ctx context.Context, contractID string)
 // to RabbitMQ for async workers (notifications, webhooks, analytics).
 // ---------------------------------------------------------------------------
 
-func (p *EventProcessor) Broadcast(ctx context.Context, circleID string, eventType string, payload any) {
+func (p *EventProcessor) Broadcast(ctx context.Context, circleID string, eventType string, payload any, ts time.Time) {
 	// Real-time WebSocket broadcast to subscribed clients
 	if p.wsBroadcast != nil {
 		p.wsBroadcast(circleID, payload)
@@ -1125,7 +1139,7 @@ func (p *EventProcessor) Broadcast(ctx context.Context, circleID string, eventTy
 		"type":      eventType,
 		"circleId":  circleID,
 		"payload":   payload,
-		"timestamp": time.Now().UTC(),
+		"timestamp": ts,
 	})
 	if err != nil {
 		log.Warn().Err(err).Msg("marshaling event for rabbitmq")

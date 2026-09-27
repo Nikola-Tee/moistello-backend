@@ -148,13 +148,17 @@ func (e *Engine) poll(ctx context.Context) error {
 		}
 
 		filtered := e.poller.FilterByContract(txns)
-		for _, txn := range filtered {
+		for i := range filtered {
+			// Attach the ledger's close time so the processor can use it
+			// instead of time.Now() for consistent, ledger-ordered timestamps (#471).
+			filtered[i].LedgerCloseTime = ledger.ClosedAt
+			txn := &filtered[i]
 			if e.dedup.Has(txn.Hash) {
 				continue
 			}
 			e.dedup.Add(txn.Hash)
 
-			if err := e.processor.ProcessTransaction(ctx, &txn); err != nil {
+			if err := e.processor.ProcessTransaction(ctx, txn); err != nil {
 				log.Error().Err(err).Str("hash", txn.Hash).Msg("processing failed")
 				e.metrics.ProcessErrors.Inc()
 				continue

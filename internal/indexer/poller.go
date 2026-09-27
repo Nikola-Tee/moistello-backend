@@ -45,6 +45,11 @@ type Transaction struct {
 	SourceAccount string      `json:"source_account"`
 	Successful    bool        `json:"successful"`
 	Operations    []Operation `json:"operations"`
+	// LedgerCloseTime is the close time of the ledger containing this
+	// transaction, set by the engine from the Horizon ledger response.
+	// Used instead of time.Now() to ensure timestamps follow ledger
+	// sequence ordering (#471).
+	LedgerCloseTime time.Time `json:"-"`
 }
 
 // Operation represents a single operation within a Stellar transaction.
