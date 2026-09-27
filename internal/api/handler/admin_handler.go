@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 	"github.com/moistello/backend/internal/domain/admin"
 	"github.com/moistello/backend/internal/domain/audit"
 	"github.com/moistello/backend/internal/domain/circle"
@@ -71,6 +73,92 @@ func (h *AdminHandler) ListUsers(c *gin.Context) {
 		return
 	}
 	response.OKWithMeta(c, gin.H{"users": users}, response.NewPaginationMeta(page, limit, total))
+}
+
+// @Summary [Admin] List soft-deleted users
+// @Description Lists soft-deleted users with pagination and search. Admin only. Soft-deleted users are excluded from every normal user and auth lookup; this endpoint is the administrative view of them.
+// @Tags Admin
+// @Produce json
+// @Security BearerAuth
+// @Param search query string false "Search by wallet or email"
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Success 200 {object} response.Envelope{data=object{users=array},meta=response.PaginationMeta}
+// @Failure 500 {object} response.Envelope
+// @Router /admin/users/deleted [get]
+func (h *AdminHandler) ListDeletedUsers(c *gin.Context) {
+	page, limit, _ := pagination.Parse(c)
+	filter := user.UserFilter{
+		Search: c.Query("search"),
+		Page:   page,
+		Limit:  limit,
+	}
+	users, err := h.userRepo.ListDeleted(c.Request.Context(), filter)
+	if err != nil {
+		response.InternalError(c, "failed to list deleted users")
+		return
+	}
+	total, err := h.userRepo.CountDeleted(c.Request.Context(), filter)
+	if err != nil {
+		response.InternalError(c, "failed to count deleted users")
+		return
+	}
+	response.OKWithMeta(c, gin.H{"users": users}, response.NewPaginationMeta(page, limit, total))
+}
+
+// @Summary [Admin] Restore a soft-deleted user
+// @Description Restores a soft-deleted user by clearing deleted_at, returning them to the active set so they can authenticate again. The audit trail and all related records are preserved. Admin only.
+// @Tags Admin
+// @Produce json
+// @Security BearerAuth
+// @Param id path string true "User ID"
+// @Success 200 {object} response.Envelope
+// @Failure 404 {object} response.Envelope
+// @Failure 409 {object} response.Envelope
+// @Router /admin/users/{id}/restore [post]
+func (h *AdminHandler) RestoreUser(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "invalid user ID")
+		return
+	}
+
+	ctx := c.Request.Context()
+	if err := h.userRepo.Restore(ctx, id); err != nil {
+		switch {
+		case errors.Is(err, user.ErrUserNotFound):
+			response.NotFound(c, "user not found")
+			return
+		case errors.Is(err, user.ErrUserNotDeleted):
+			// The user exists and is already active; restoring would be a no-op.
+			response.Conflict(c, "user is not deleted")
+			return
+		default:
+			response.InternalError(c, "failed to restore user")
+			return
+		}
+	}
+
+	// Record the administrative action so the audit trail captures who
+	// re-admitted the account, not just that the account was deleted.
+	if h.auditRepo != nil {
+		actorID, _ := uuid.Parse(c.GetString("userID"))
+		details, _ := json.Marshal(map[string]string{"restoredUserId": id.String()})
+		entry := &audit.AuditEntry{
+			ActorID:      actorID,
+			Action:       "user.restored",
+			ResourceType: "user",
+			ResourceID:   sql.NullString{String: id.String(), Valid: true},
+			Details:      details,
+		}
+		if err := h.auditRepo.Log(ctx, entry); err != nil {
+			// The user is already restored; failing the request here would be
+			// misleading, so record the problem and still report success.
+			log.Warn().Err(err).Str("userId", id.String()).Msg("failed to audit user restore")
+		}
+	}
+
+	response.OK(c, gin.H{"id": id, "restored": true})
 }
 
 // @Summary [Admin] List all circles
