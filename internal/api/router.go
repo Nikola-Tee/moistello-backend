@@ -309,6 +309,10 @@ func NewRouter(
 		admin.Use(middleware.AdminMiddleware())
 		{
 			admin.GET("/users", adminHandler.ListUsers)
+		// Registered before any /users/:id route so the static "deleted" segment
+		// is not captured by a wildcard parameter.
+		admin.GET("/users/deleted", adminHandler.ListDeletedUsers)
+		admin.POST("/users/:id/restore", adminHandler.RestoreUser)
 			admin.GET("/circles", adminHandler.ListCircles)
 			admin.GET("/circles/:id/inspect", adminHandler.InspectCircleState)
 			admin.GET("/audit-log", adminHandler.GetAuditLog)
