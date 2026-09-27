@@ -318,6 +318,7 @@ func NewRouter(
 
 		admin := authenticated.Group("/admin")
 		admin.Use(middleware.AdminMiddleware())
+		admin.Use(perResource(redisClient, "admin", cfg.RateLimit.AdminLimit, cfg.RateLimit.AdminWindowSeconds))
 		{
 			admin.GET("/users", adminHandler.ListUsers)
 			admin.GET("/circles", adminHandler.ListCircles)

@@ -290,6 +290,8 @@ type RateLimitConfig struct {
 	PasswordResetIPLimit        int `mapstructure:"password_reset_ip_limit"`
 	PasswordResetAccountLimit   int `mapstructure:"password_reset_account_limit"`
 	PasswordResetWindowSeconds  int `mapstructure:"password_reset_window_seconds"`
+	AdminLimit                  int `mapstructure:"admin_limit"`
+	AdminWindowSeconds          int `mapstructure:"admin_window_seconds"`
 }
 
 type LoggingConfig struct {
@@ -380,6 +382,8 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "rate_limit.wallet_transfer_window_seconds", 60)
 	setDefault(v, "rate_limit.referral_limit", 10)
 	setDefault(v, "rate_limit.referral_window_seconds", 3600)
+	setDefault(v, "rate_limit.admin_limit", 50)
+	setDefault(v, "rate_limit.admin_window_seconds", 60)
 	setDefault(v, "logging.level", "debug")
 	setDefault(v, "logging.format", "json")
 	setDefault(v, "logging.output", "stdout")
