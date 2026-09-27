@@ -15,6 +15,7 @@ type Reconciler struct {
 	poller             *Poller
 	processor          *EventProcessor
 	dedup              *Deduplicator
+	deadLetters        DeadLetterStore
 	interval           time.Duration
 	batchSize          int
 	maxLedgersPerCycle int
@@ -36,6 +37,13 @@ func NewReconciler(
 		batchSize:          50,
 		maxLedgersPerCycle: 500,
 	}
+}
+
+// WithDeadLetters wires the dead-letter store used to record events that
+// could not be processed (#349).
+func (r *Reconciler) WithDeadLetters(store DeadLetterStore) *Reconciler {
+	r.deadLetters = store
+	return r
 }
 
 // WithBatchSize sets the number of ledgers fetched in each individual Horizon call.
@@ -75,6 +83,36 @@ func (r *Reconciler) StartReconciliation(ctx context.Context, interval time.Dura
 			log.Info().Msg("reconciler stopped")
 			return
 		}
+	}
+}
+
+// recordDeadLetter stores a failed event so it can be replayed after the
+// underlying fault is fixed (#349). It is a no-op when no store is wired, so
+// the reconciler stays usable in tests and dry runs.
+func (r *Reconciler) recordDeadLetter(ctx context.Context, txn *Transaction, ledger int64, cause error) {
+	if r.deadLetters == nil {
+		return
+	}
+
+	payload, err := MarshalPayload(txn)
+	if err != nil {
+		// A payload we cannot serialise must not stop the failure being
+		// recorded; the hash and error are what matter for triage.
+		log.Warn().Err(err).Str("hash", txn.Hash).Msg("serializing dead letter payload")
+	}
+
+	if _, err := r.deadLetters.Record(ctx, &DeadLetterEntry{
+		Chain:    "stellar",
+		TxHash:   txn.Hash,
+		Ledger:   ledger,
+		Error:    cause.Error(),
+		Attempts: 1,
+		Payload:  payload,
+		Status:   "dead_letter",
+	}); err != nil {
+		// Bookkeeping must never turn a recoverable per-event failure into a
+		// failed reconciliation run.
+		log.Error().Err(err).Str("hash", txn.Hash).Msg("recording dead letter failed")
 	}
 }
 
@@ -171,6 +209,10 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 					log.Warn().Err(err).
 						Str("hash", txn.Hash).
 						Msg("reconciler process error")
+					// Record the failure so it can be replayed later. Without
+					// this the reconciliation advances the cursor past an event
+					// that was never processed, losing it silently (#349).
+					r.recordDeadLetter(ctx, &txn, ledger.Sequence, err)
 					continue
 				}
 				processed++

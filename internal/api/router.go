@@ -63,6 +63,7 @@ func NewRouter(
 	referralHandler *handler.ReferralHandler,
 	consentHandler *handler.ConsentHandler,
 	adminJobQueueHandler *handler.AdminJobQueueHandler,
+	adminIndexerHandler *handler.AdminIndexerHandler,
 	webhookRepo webhook.WebhookRepository,
 	yellowCardWebhookHandler *handler.YellowCardWebhookHandler,
 	jwtPublicKey []byte,
@@ -323,6 +324,8 @@ func NewRouter(
 			admin.DELETE("/feature-flags/:flag", adminHandler.DeleteFeatureFlag)
 			admin.GET("/jobs/dead-letter", adminJobQueueHandler.GetDeadLetterJobs)
 			admin.POST("/jobs/dead-letter/:id/retry", adminJobQueueHandler.RetryDeadLetterJob)
+			admin.GET("/indexer/dead-letter", adminIndexerHandler.GetDeadLetterEvents)
+			admin.POST("/indexer/dead-letter/:id/resolve", adminIndexerHandler.ResolveDeadLetterEvent)
 		}
 
 		optional := api.Group("")

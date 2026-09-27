@@ -15,6 +15,9 @@ type IndexerMetrics struct {
 	DedupSize             prometheus.Gauge
 	CursorLagSeconds      prometheus.Gauge
 	UnknownContractEvents prometheus.Counter
+	// DeadLettered counts events recorded in the indexer dead-letter queue
+	// because they could not be processed (#349).
+	DeadLettered prometheus.Counter
 	// Events carries the per-event-type counters. It is nil only in tests that
 	// deliberately build a partial IndexerMetrics.
 	Events *EventCounters
@@ -150,6 +153,10 @@ func NewIndexerMetrics() *IndexerMetrics {
 		UnknownContractEvents: promauto.NewCounter(prometheus.CounterOpts{
 			Name: "moistello_indexer_unknown_contract_events_total",
 			Help: "Total contract events skipped because they came from an unknown contract",
+		}),
+		DeadLettered: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "moistello_indexer_dead_lettered_total",
+			Help: "Total indexer events recorded in the dead-letter queue after a processing failure",
 		}),
 		Events: NewEventCounters(prometheus.DefaultRegisterer),
 	}
