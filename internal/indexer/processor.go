@@ -40,6 +40,10 @@ type EventProcessor struct {
 	// Events from any other contract are skipped and recorded, never dispatched.
 	knownContracts map[string]struct{}
 	unknownEvents  prometheus.Counter
+
+	// events holds the per-event-type counters. May be nil, in which case no
+	// per-type counting happens.
+	events *EventCounters
 }
 
 // NewEventProcessor creates a new EventProcessor with all required dependencies.
@@ -82,6 +86,14 @@ func (p *EventProcessor) SetKnownContracts(ids []string) {
 			p.knownContracts[fmt.Sprintf("%x", raw)] = struct{}{}
 		}
 	}
+}
+
+// SetEventCounters attaches the per-event-type counters. Every event that
+// reaches processContractEvents is counted by event type, so a new contract
+// event type becomes visible on /metrics on its first arrival with no change to
+// this package.
+func (p *EventProcessor) SetEventCounters(c *EventCounters) {
+	p.events = c
 }
 
 func (p *EventProcessor) isUnknownContract(contractID string) bool {
@@ -168,7 +180,7 @@ func (p *EventProcessor) handlePayment(ctx context.Context, txn *Transaction, op
 // invoke_host_function operation, extracts all Soroban contract events, and
 // dispatches each to the appropriate typed handler.
 func (p *EventProcessor) handleSorobanInvoke(ctx context.Context, txn *Transaction, op *Operation) error {
-	events, err := ParseContractEvents(txn.Hash, txn.Ledger, op.ResultMetaXDR)
+	events, skipped, err := ParseContractEvents(txn.Hash, txn.Ledger, op.ResultMetaXDR)
 	if err != nil {
 		// Non-fatal: log and continue; the event is on-chain and will be
 		// retried by the reconciler on the next pass.
@@ -179,6 +191,11 @@ func (p *EventProcessor) handleSorobanInvoke(ctx context.Context, txn *Transacti
 			Msg("parsing contract events from result_meta_xdr")
 		return nil
 	}
+	if skipped > 0 && p.events != nil {
+		// Undecodable events cannot be attributed to an event type, so they
+		// are counted by reason rather than folded into the per-type totals.
+		p.events.DecodeSkipped.WithLabelValues("malformed_event").Add(float64(skipped))
+	}
 
 	p.processContractEvents(ctx, txn.Hash, events)
 	return nil
@@ -188,12 +205,18 @@ func (p *EventProcessor) handleSorobanInvoke(ctx context.Context, txn *Transacti
 // the contract_events log. Events from unknown contracts are skipped, counted
 // and only recorded so they can be decoded later; a single bad event never
 // stops the rest of the transaction from being processed.
+//
+// This is the single choke point every decoded event passes through, which is
+// what keeps the per-event-type counters complete: every event is counted
+// exactly once here, whatever its type, so a type the indexer has never seen
+// still lands in the counters.
 func (p *EventProcessor) processContractEvents(ctx context.Context, txHash string, events []ContractEvent) {
 	for _, ev := range events {
 		if p.isUnknownContract(ev.ContractID) {
 			if p.unknownEvents != nil {
 				p.unknownEvents.Inc()
 			}
+			p.events.Count(ev.EventType, OutcomeDLQ)
 			log.Warn().
 				Str("event_type", ev.EventType).
 				Str("contract", ev.ContractID).
@@ -202,6 +225,7 @@ func (p *EventProcessor) processContractEvents(ctx context.Context, txHash strin
 			continue
 		}
 		if err := p.safeDispatchEvent(ctx, &ev); err != nil {
+			p.events.Count(ev.EventType, OutcomeFailed)
 			log.Warn().Err(err).
 				Str("event_type", ev.EventType).
 				Str("contract", ev.ContractID).
@@ -209,6 +233,7 @@ func (p *EventProcessor) processContractEvents(ctx context.Context, txHash strin
 				Msg("dispatching contract event")
 			continue
 		}
+		p.events.Count(ev.EventType, OutcomeDecoded)
 	}
 
 	// Persist every event to the contract_events audit table regardless of
@@ -408,20 +433,19 @@ func (p *EventProcessor) onContributionReceived(ctx context.Context, ev *Contrac
 		CreatedAt:   time.Now().UTC(),
 		UpdatedAt:   time.Now().UTC(),
 	}
-	if err := p.contribRepo.Create(ctx, contrib); err != nil {
+	// The contribution and the circle's round/total counters are written in one
+	// transaction under a per-circle advisory lock, so a crash can never leave
+	// a contribution recorded against stale circle state, and concurrent
+	// contributions to the same circle cannot lose one another's amount.
+	advance, err := p.applyContribution(ctx, contrib)
+	if err != nil {
 		if errors.Is(err, apperrors.ErrConflict) {
 			// Already recorded by an earlier pass over this ledger range;
 			// skip the counter update so totals are not counted twice.
 			log.Debug().Str("tx_hash", ev.TxHash).Msg("ContributionReceived: already recorded")
 			return nil
 		}
-		return fmt.Errorf("onContributionReceived create: %w", err)
-	}
-
-	// Update circle's total contributions counter.
-	c.TotalContributions += amount
-	if err := p.circleRepo.Update(ctx, c); err != nil {
-		log.Warn().Err(err).Msg("ContributionReceived: updating circle totals")
+		return fmt.Errorf("onContributionReceived record contribution: %w", err)
 	}
 
 	log.Info().
@@ -429,6 +453,7 @@ func (p *EventProcessor) onContributionReceived(ctx context.Context, ev *Contrac
 		Str("user_id", u.ID.String()).
 		Float64("amount", amount).
 		Int("round", round).
+		Bool("round_advanced", advance.Advanced).
 		Msg("ContributionReceived: contribution persisted")
 
 	p.Broadcast(ctx, c.ID.String(), "contribution.confirmed", map[string]any{
@@ -489,18 +514,12 @@ func (p *EventProcessor) onPayoutExecuted(ctx context.Context, ev *ContractEvent
 		PayoutType:  pt,
 		CreatedAt:   time.Now().UTC(),
 	}
-	if err := p.payoutRepo.Create(ctx, p2); err != nil {
+	if err := p.recordPayoutAndAdvance(ctx, p2); err != nil {
 		if errors.Is(err, apperrors.ErrConflict) {
 			log.Debug().Str("tx_hash", ev.TxHash).Msg("PayoutExecuted: already recorded")
 			return nil
 		}
-		return fmt.Errorf("onPayoutExecuted create payout: %w", err)
-	}
-
-	// Advance current round.
-	c.CurrentRound = round + 1
-	if err := p.circleRepo.Update(ctx, c); err != nil {
-		log.Warn().Err(err).Msg("PayoutExecuted: advancing circle round")
+		return fmt.Errorf("onPayoutExecuted record payout: %w", err)
 	}
 
 	log.Info().
@@ -709,22 +728,68 @@ func (p *EventProcessor) onCircleCompleted(ctx context.Context, ev *ContractEven
 }
 
 // onAuctionBid handles AuctionBid(circle_id, bidder, discount_bips, round).
-// No persistent table exists yet — logs and broadcasts only.
-// TODO: Persist to auction_bids table (follow-up issue).
+// Persists the bid to circle_auction_bids table and broadcasts the event.
 func (p *EventProcessor) onAuctionBid(ctx context.Context, ev *ContractEvent) error {
 	contractID := payloadStr(ev.Payload, "circle_id")
+	if contractID == "" {
+		contractID = ev.ContractID
+	}
 	bidder := payloadStr(ev.Payload, "bidder")
 	discountBips := payloadInt(ev.Payload, "discount_bips")
 	round := payloadInt(ev.Payload, "round")
 
+	if p.circleRepo == nil || p.userRepo == nil {
+		p.Broadcast(ctx, contractID, "auction.bid", map[string]any{
+			"contract_id":   contractID,
+			"bidder":        bidder,
+			"discount_bips": discountBips,
+			"round":         round,
+			"tx_hash":       ev.TxHash,
+		})
+		return nil
+	}
+
+	c, err := p.circleRepo.FindByContractID(ctx, contractID)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("contract_id", contractID).Msg("AuctionBid: circle not found")
+			return nil
+		}
+		return fmt.Errorf("onAuctionBid find circle: %w", err)
+	}
+
+	u, err := p.userRepo.FindByWalletAddress(ctx, bidder)
+	if err != nil {
+		if isNotFound(err) {
+			log.Warn().Str("wallet", bidder).Msg("AuctionBid: user not found")
+			return nil
+		}
+		return fmt.Errorf("onAuctionBid find user: %w", err)
+	}
+
+	bid := &circle.CircleAuctionBid{
+		ID:          uuid.New(),
+		CircleID:    c.ID,
+		BidderID:    u.ID,
+		RoundNumber: round,
+		BidAmount:   float64(discountBips),
+		CreatedAt:   time.Now().UTC(),
+	}
+
+	if err := p.circleRepo.CreateAuctionBid(ctx, bid); err != nil {
+		return fmt.Errorf("onAuctionBid create auction bid: %w", err)
+	}
+
 	log.Info().
-		Str("contract_id", contractID).
-		Str("bidder", bidder).
+		Str("circle_id", c.ID.String()).
+		Str("bidder_id", u.ID.String()).
 		Int("discount_bips", discountBips).
 		Int("round", round).
-		Msg("AuctionBid: bid received")
+		Msg("AuctionBid: bid persisted")
 
-	p.Broadcast(ctx, contractID, "auction.bid", map[string]any{
+	p.Broadcast(ctx, c.ID.String(), "auction.bid", map[string]any{
+		"circle_id":     c.ID.String(),
+		"bidder_id":     u.ID.String(),
 		"contract_id":   contractID,
 		"bidder":        bidder,
 		"discount_bips": discountBips,

@@ -58,39 +58,47 @@ func logSkippedEvent(reason, txHash string, ledger int64, contractID string, raw
 // returned ContractEvent is fully decoded with its EventType and Payload fields
 // populated from the raw SCVal topics and data.
 //
+// The second return value is the number of events that were present in the
+// metadata but could not be decoded. Those are not attributable to an event
+// type — an event that fails to decode frequently has no readable type name —
+// so callers surface them as a separate signal rather than mixing them into
+// per-event-type totals.
+//
 // Malformed or unrecognised XDR is silently skipped — the function returns
 // whatever events could be successfully decoded along with the first error
 // encountered (if any). Callers should treat partial results as valid.
-func ParseContractEvents(txHash string, ledger int64, resultMetaXDR string) ([]ContractEvent, error) {
+func ParseContractEvents(txHash string, ledger int64, resultMetaXDR string) ([]ContractEvent, int, error) {
 	if resultMetaXDR == "" {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	raw, err := base64.StdEncoding.DecodeString(resultMetaXDR)
 	if err != nil {
-		return nil, fmt.Errorf("base64 decode result_meta_xdr: %w", err)
+		return nil, 0, fmt.Errorf("base64 decode result_meta_xdr: %w", err)
 	}
 
 	var meta xdr.TransactionMeta
 	if _, err := xdr.Unmarshal(bytes.NewReader(raw), &meta); err != nil {
-		return nil, fmt.Errorf("xdr unmarshal TransactionMeta: %w", err)
+		return nil, 0, fmt.Errorf("xdr unmarshal TransactionMeta: %w", err)
 	}
 
 	// Soroban contract events live in V3 metadata.
 	v3 := meta.V3
 	if v3 == nil {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	var events []ContractEvent
+	skipped := 0
 	for _, diagEvent := range v3.SorobanMeta.Events {
 		ev, ok := decodeContractEvent(txHash, ledger, diagEvent)
 		if !ok {
+			skipped++
 			continue
 		}
 		events = append(events, ev)
 	}
-	return events, nil
+	return events, skipped, nil
 }
 
 // decodeContractEvent converts a raw xdr.ContractEvent into a typed ContractEvent.

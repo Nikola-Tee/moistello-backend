@@ -69,15 +69,28 @@ func NewRouter(
 ) *gin.Engine {
 	r := gin.New()
 
+	// CSRF boundary (#399). CSRF tokens are bound to the bearer session, so they
+	// are enforced wherever a request is authenticated:
+	//   - wsRoute, authenticated (and admin, nested in it): always enforced.
+	//   - optional: enforced when an Authorization header is present
+	//     (CSRFTokenValidatorIfAuthenticated); anonymous callers have no session.
+	// Exempt by design (no user session to protect / not browser-initiated):
+	//   - /webhooks/incoming/:id, /webhooks/yellowcard: server-to-server,
+	//     verified by the webhook handlers themselves.
+	//   - /v1/auth/{register,register/verify,refresh,nonce,verify}: they create
+	//     or exchange the session, so no CSRF token can exist yet.
+	//   - /v1/claim-name: anonymous, not user-bound (allocates the next name).
+	// TestRouter_CSRFCoverage enforces this: any new state-changing route must be
+	// CSRF-enforced or explicitly added to its exemption list.
+
 	r.Use(middleware.RecoveryMiddleware())
 	r.Use(middleware.TracingMiddleware(cfg.Tracing.ServiceName))
 	r.Use(middleware.LoggingMiddleware())
 	r.Use(middleware.CORSMiddleware(cfg.CORS))
 	r.Use(middleware.PrometheusMiddleware())
 
-	// Prometheus metrics endpoint — protected by admin API key, un-rate-limited
-	metricsKey := cfg.Auth.AdminAPIKey
-	r.GET("/metrics", middleware.AdminAPIKeyMiddleware(metricsKey), gin.WrapH(promhttp.Handler()))
+	// Prometheus metrics endpoint — protected by admin API key (primary + secondary for zero-downtime rotation), un-rate-limited
+	r.GET("/metrics", middleware.AdminAPIKeyMiddleware(cfg.Auth.AdminAPIKey, cfg.Auth.AdminAPIKeySecondary), gin.WrapH(promhttp.Handler()))
 
 	r.Use(middleware.RateLimitMiddleware(redisClient, cfg.RateLimit, liveLimitOptions(cfg)...))
 
@@ -116,6 +129,12 @@ func NewRouter(
 		}
 
 		// User & Profile routes (authenticated)
+		// Public — claim a unique anonymous name (before auth). Registered on the
+		// bare api group (no auth, so no CSRF session); see the CSRF boundary
+		// note above. Kept out of the authenticated block below so it can't be
+		// mistaken for an authenticated route.
+		api.POST("/claim-name", userHandler.ClaimName)
+
 		authenticated := api.Group("")
 		authenticated.Use(middleware.AuthMiddleware(jwtPublicKey))
 		authenticated.Use(middleware.TokenBlocklistMiddleware(redisClient))
@@ -124,6 +143,21 @@ func NewRouter(
 		// user (#198) — a global, pre-auth middleware let idempotency keys
 		// collide across different users' requests.
 		authenticated.Use(middleware.IdempotencyMiddleware(redisClient))
+		// Idempotency audit (#393). Every POST/PUT/PATCH/DELETE registered on
+		// `authenticated` (and its `admin` sub-group) runs IdempotencyMiddleware
+		// above. That middleware is opt-in per request, so routes that move
+		// funds or cast a binding vote/bid additionally mount requireIdem,
+		// making the Idempotency-Key header mandatory there:
+		//   wallets/withdraw, wallet/deposit, wallet/withdraw,
+		//   wallet/mobile-money/{onramp,offramp}, circles/:id/{contribute,
+		//   payout,vote,auction-bid}, circles/:id/invites,
+		//   governance/proposals/:id/{vote,execute}, token/{stake,unstake},
+		//   swap/{offer,accept,cancel}.
+		// Intentionally NOT idempotency-wrapped: /v1/auth/* (pre-auth, keys
+		// would be unscoped — see #198), public webhooks (idempotent by
+		// provider event ID internally), POST /v1/claim-name (public,
+		// pre-auth) and optional-auth POST /v1/consent.
+		requireIdem := middleware.RequireIdempotencyKey()
 		{
 			authenticated.GET("/me", authHandler.Me)
 			authenticated.POST("/auth/logout", authHandler.Logout)
@@ -131,9 +165,6 @@ func NewRouter(
 			authenticated.DELETE("/sessions/:id", authHandler.RevokeSessionByID)
 
 			authenticated.POST("/users/username/claim", userHandler.ClaimName)
-
-			// Public — claim a unique anonymous name (before auth)
-			api.POST("/claim-name", userHandler.ClaimName)
 
 			// Passkey credential store/retrieval
 			authenticated.POST("/credential", passkeyCredentialHandler.StoreCredential)
@@ -143,7 +174,7 @@ func NewRouter(
 			authenticated.POST("/wallets", walletHandler.CreateWallet)
 			authenticated.GET("/wallets", walletHandler.ListWallets)
 			authenticated.GET("/wallets/balance", walletHandler.GetBalance)
-			authenticated.POST("/wallets/withdraw", perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), walletHandler.Withdraw)
+			authenticated.POST("/wallets/withdraw", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), walletHandler.Withdraw)
 			authenticated.DELETE("/wallets/:id", walletHandler.DeleteWallet)
 
 			// Authenticator (TOTP) enrollment. Code checks share the OTP
@@ -157,11 +188,12 @@ func NewRouter(
 
 			// Deposit / Withdraw routes
 			authenticated.GET("/wallet/deposit/quote", depositHandler.GetDepositQuote)
-			authenticated.POST("/wallet/deposit", perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), depositHandler.InitiateDeposit)
-			authenticated.POST("/wallet/withdraw", perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), depositHandler.InitiateWithdraw)
+			authenticated.POST("/wallet/deposit", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), depositHandler.InitiateDeposit)
+			authenticated.POST("/wallet/withdraw", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), depositHandler.InitiateWithdraw)
 			authenticated.GET("/wallet/transactions/:yellowCardId", depositHandler.GetTransactionStatus)
-			authenticated.POST("/wallet/mobile-money/onramp", perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), mobileMoneyHandler.InitiateOnramp)
-			authenticated.POST("/wallet/mobile-money/offramp", perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), mobileMoneyHandler.InitiateOfframp)
+			authenticated.GET("/wallet/mobile-money/providers", mobileMoneyHandler.ListProviders)
+			authenticated.POST("/wallet/mobile-money/onramp", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), mobileMoneyHandler.InitiateOnramp)
+			authenticated.POST("/wallet/mobile-money/offramp", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), mobileMoneyHandler.InitiateOfframp)
 			authenticated.GET("/wallet/mobile-money/:id", mobileMoneyHandler.GetTransaction)
 
 			authenticated.POST("/chat/keys", chatHandler.PublishKeys)
@@ -176,23 +208,24 @@ func NewRouter(
 			authenticated.GET("/circles/:id", circleHandler.GetCircle)
 			authenticated.PATCH("/circles/:id", circleHandler.UpdateCircle)
 			authenticated.POST("/circles/:id/start", circleHandler.StartCircle)
-			authenticated.POST("/circles/:id/payout", circleHandler.TriggerPayout)
+			authenticated.POST("/circles/:id/payout", requireIdem, circleHandler.TriggerPayout)
+			authenticated.POST("/circles/:id/payout/preview", circleHandler.PreviewPayout)
 			authenticated.POST("/circles/:id/close", circleHandler.CloseCircle)
 			authenticated.DELETE("/circles/:id", circleHandler.CancelCircle)
 			authenticated.POST("/circles/:id/join", circleHandler.JoinCircle)
-			authenticated.POST("/circles/:id/contribute", perResource(redisClient, "contribute", cfg.RateLimit.ContributeLimit, cfg.RateLimit.ContributeWindowSeconds), circleHandler.Contribute)
+			authenticated.POST("/circles/:id/contribute", requireIdem, perResource(redisClient, "contribute", cfg.RateLimit.ContributeLimit, cfg.RateLimit.ContributeWindowSeconds), circleHandler.Contribute)
 			authenticated.POST("/circles/:id/exit", circleHandler.ExitCircle)
 			authenticated.GET("/circles/:id/members", circleHandler.GetMembers)
 			authenticated.GET("/circles/:id/rounds", circleHandler.GetRounds)
 			authenticated.GET("/circles/:id/rounds/:round/config", circleHandler.GetRoundConfig)
 			authenticated.GET("/circles/:id/payouts", circleHandler.GetPayouts)
 			authenticated.POST("/circles/:id/dispute", circleHandler.Dispute)
-			authenticated.POST("/circles/:id/vote", circleHandler.Vote)
-			authenticated.POST("/circles/:id/auction-bid", circleHandler.AuctionBid)
+			authenticated.POST("/circles/:id/vote", requireIdem, circleHandler.Vote)
+			authenticated.POST("/circles/:id/auction-bid", requireIdem, circleHandler.AuctionBid)
 			authenticated.POST("/circles/:id/members/:address/remove", circleHandler.RemoveMember)
 
 			authenticated.GET("/circles/:id/invites", inviteHandler.ListInvites)
-			authenticated.POST("/circles/:id/invites", inviteHandler.CreateInvite)
+			authenticated.POST("/circles/:id/invites", requireIdem, inviteHandler.CreateInvite)
 			authenticated.DELETE("/invites/:code", inviteHandler.RevokeInvite)
 
 			authenticated.GET("/contributions", contributionHandler.ListContributions)
@@ -205,8 +238,8 @@ func NewRouter(
 			authenticated.POST("/governance/proposals", governanceHandler.CreateProposal)
 			authenticated.GET("/governance/proposals", governanceHandler.ListProposals)
 			authenticated.GET("/governance/proposals/:id", governanceHandler.GetProposal)
-			authenticated.POST("/governance/proposals/:id/vote", governanceHandler.VoteProposal)
-			authenticated.POST("/governance/proposals/:id/execute", governanceHandler.ExecuteProposal)
+			authenticated.POST("/governance/proposals/:id/vote", requireIdem, governanceHandler.VoteProposal)
+			authenticated.POST("/governance/proposals/:id/execute", requireIdem, governanceHandler.ExecuteProposal)
 
 			// Reputation tiers
 			authenticated.GET("/reputation/tiers", reputationHandler.GetTiers)
@@ -256,14 +289,14 @@ func NewRouter(
 
 			// Token routes
 			authenticated.GET("/token/balance/:address", tokenHandler.GetBalance)
-			authenticated.POST("/token/stake", tokenHandler.Stake)
-			authenticated.POST("/token/unstake", tokenHandler.Unstake)
+			authenticated.POST("/token/stake", requireIdem, tokenHandler.Stake)
+			authenticated.POST("/token/unstake", requireIdem, tokenHandler.Unstake)
 			authenticated.GET("/token/stakes/:address", tokenHandler.GetStakes)
 
 			// Swap endpoints
-			authenticated.POST("/swap/offer", perResource(redisClient, "swap", cfg.RateLimit.SwapLimit, cfg.RateLimit.SwapWindowSeconds), swapHandler.CreateSwapOffer)
-			authenticated.POST("/swap/accept", perResource(redisClient, "swap", cfg.RateLimit.SwapLimit, cfg.RateLimit.SwapWindowSeconds), swapHandler.AcceptSwapOffer)
-			authenticated.POST("/swap/cancel", perResource(redisClient, "swap", cfg.RateLimit.SwapLimit, cfg.RateLimit.SwapWindowSeconds), swapHandler.CancelSwapOffer)
+			authenticated.POST("/swap/offer", requireIdem, perResource(redisClient, "swap", cfg.RateLimit.SwapLimit, cfg.RateLimit.SwapWindowSeconds), swapHandler.CreateSwapOffer)
+			authenticated.POST("/swap/accept", requireIdem, perResource(redisClient, "swap", cfg.RateLimit.SwapLimit, cfg.RateLimit.SwapWindowSeconds), swapHandler.AcceptSwapOffer)
+			authenticated.POST("/swap/cancel", requireIdem, perResource(redisClient, "swap", cfg.RateLimit.SwapLimit, cfg.RateLimit.SwapWindowSeconds), swapHandler.CancelSwapOffer)
 			authenticated.GET("/swap/history", swapHandler.GetSwapHistory)
 
 			authenticated.POST("/webhooks", webhookHandler.RegisterWebhook)
@@ -290,6 +323,9 @@ func NewRouter(
 
 		optional := api.Group("")
 		optional.Use(middleware.OptionalAuthMiddleware(jwtPublicKey))
+		// Authenticated callers on optional-auth routes (e.g. POST /consent
+		// writing a signed-in user's consent) must pass CSRF too (#399).
+		optional.Use(middleware.CSRFTokenValidatorIfAuthenticated(redisClient))
 		{
 			optional.GET("/circles", circleHandler.ListCircles)
 

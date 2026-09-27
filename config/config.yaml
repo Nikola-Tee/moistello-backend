@@ -57,6 +57,11 @@ auth:
   access_token_ttl: "240m"
   refresh_token_ttl: "168h"
   nonce_ttl: "5m"
+  # Expired-session reclamation runs only from the scheduled cleanup job
+  # (#374). Every replica schedules it with random jitter up to cleanup_jitter
+  # and the first to take the Redis cleanup lock performs the sweep.
+  cleanup_interval: "5m"
+  cleanup_jitter: "30s"
 
 security:
   # Required secrets. Prefer loading them from .env during local development.

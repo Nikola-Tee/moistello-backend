@@ -33,6 +33,7 @@ func newUnregisteredMetrics() *IndexerMetrics {
 		CursorLagSeconds:      prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_cursor_lag_seconds"}),
 		UnknownContractEvents: prometheus.NewCounter(prometheus.CounterOpts{Name: "test_unknown_contract_events"}),
 		ReorgsDetected:        prometheus.NewCounter(prometheus.CounterOpts{Name: "test_reorgs_detected"}),
+		Events:                NewEventCounters(prometheus.NewRegistry()),
 	}
 }
 

@@ -3,7 +3,9 @@ package handler
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -99,18 +101,31 @@ func (h *AdminHandler) ListCircles(c *gin.Context) {
 }
 
 // @Summary [Admin] Get audit log
-// @Description Returns a paginated system audit log. Admin only.
+// @Description Returns a paginated system audit log, optionally filtered by resource type, action, actor, and time range. Admin only.
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
 // @Param page query int false "Page number" default(1)
 // @Param limit query int false "Items per page" default(20)
+// @Param resource_type query string false "Filter by resource type, e.g. circle"
+// @Param action query string false "Filter by action, e.g. circle.inspected"
+// @Param actor_id query string false "Filter by acting user ID (UUID)"
+// @Param from query string false "Inclusive lower bound on created_at (RFC3339 or YYYY-MM-DD)"
+// @Param to query string false "Inclusive upper bound on created_at (RFC3339 or YYYY-MM-DD)"
 // @Success 200 {object} response.Envelope{data=object{entries=array},meta=response.PaginationMeta}
+// @Failure 400 {object} response.Envelope
 // @Failure 500 {object} response.Envelope
 // @Router /admin/audit-log [get]
 func (h *AdminHandler) GetAuditLog(c *gin.Context) {
 	page, limit, _ := pagination.Parse(c)
-	entries, total, err := h.auditRepo.List(c.Request.Context(), page, limit)
+
+	filter, err := parseAuditLogFilter(c)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	entries, total, err := h.auditRepo.List(c.Request.Context(), filter, page, limit)
 	if err != nil {
 		response.InternalError(c, "failed to fetch audit log")
 		return
@@ -119,6 +134,58 @@ func (h *AdminHandler) GetAuditLog(c *gin.Context) {
 		entries = []audit.AuditEntry{}
 	}
 	response.OKWithMeta(c, gin.H{"entries": entries}, response.NewPaginationMeta(page, limit, total))
+}
+
+// parseAuditLogFilter reads the query-string filters. Anything malformed is
+// reported as an error rather than dropped, so a typo in a filter is never
+// silently turned into an unfiltered query over the whole audit log.
+func parseAuditLogFilter(c *gin.Context) (audit.ListFilter, error) {
+	var filter audit.ListFilter
+	filter.ResourceType = strings.TrimSpace(c.Query("resource_type"))
+	filter.Action = strings.TrimSpace(c.Query("action"))
+
+	if raw := strings.TrimSpace(c.Query("actor_id")); raw != "" {
+		actorID, err := uuid.Parse(raw)
+		if err != nil {
+			return filter, errors.New("actor_id must be a valid UUID")
+		}
+		filter.ActorID = &actorID
+	}
+
+	from, err := parseAuditLogTime(c.Query("from"))
+	if err != nil {
+		return filter, fmt.Errorf("from: %w", err)
+	}
+	filter.From = from
+
+	to, err := parseAuditLogTime(c.Query("to"))
+	if err != nil {
+		return filter, fmt.Errorf("to: %w", err)
+	}
+	filter.To = to
+
+	if filter.Inverted() {
+		return filter, errors.New("from must not be after to")
+	}
+	return filter, nil
+}
+
+var auditLogTimeLayouts = []string{time.RFC3339, "2006-01-02"}
+
+// parseAuditLogTime accepts a full timestamp or a plain date. A date-only value
+// is anchored at the start of that day in UTC, so `from=2026-01-02` and
+// `to=2026-01-02` bracket that whole day rather than one instant.
+func parseAuditLogTime(raw string) (*time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	for _, layout := range auditLogTimeLayouts {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return &t, nil
+		}
+	}
+	return nil, errors.New("must be an RFC3339 timestamp or a YYYY-MM-DD date")
 }
 
 // @Summary [Admin] Get system metrics

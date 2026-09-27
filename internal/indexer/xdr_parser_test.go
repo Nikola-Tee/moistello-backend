@@ -7,23 +7,26 @@ import (
 )
 
 func TestParseContractEvents_EmptyXDR(t *testing.T) {
-	events, err := ParseContractEvents("hash1", 100, "")
+	events, skipped, err := ParseContractEvents("hash1", 100, "")
 	assert.NoError(t, err)
 	assert.Empty(t, events)
+	assert.Zero(t, skipped)
 }
 
 func TestParseContractEvents_InvalidBase64(t *testing.T) {
-	events, err := ParseContractEvents("hash1", 100, "!!!not-valid-base64!!!")
+	events, skipped, err := ParseContractEvents("hash1", 100, "!!!not-valid-base64!!!")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "base64 decode")
 	assert.Nil(t, events)
+	assert.Zero(t, skipped)
 }
 
 func TestParseContractEvents_InvalidXDR(t *testing.T) {
 	// Valid base64 but not valid XDR.
-	events, err := ParseContractEvents("hash1", 100, "aGVsbG8gd29ybGQ=")
+	events, skipped, err := ParseContractEvents("hash1", 100, "aGVsbG8gd29ybGQ=")
 	assert.Error(t, err)
 	assert.Nil(t, events)
+	assert.Zero(t, skipped)
 }
 
 func TestScValToGo_Void(t *testing.T) {
