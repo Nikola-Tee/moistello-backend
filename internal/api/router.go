@@ -166,6 +166,8 @@ func NewRouter(
 		requireIdem := middleware.RequireIdempotencyKey()
 		{
 			authenticated.GET("/me", authHandler.Me)
+			authenticated.PATCH("/me", userHandler.UpdateProfile)
+			authenticated.PATCH("/users/me", userHandler.UpdateProfile)
 			authenticated.POST("/auth/logout", authHandler.Logout)
 			authenticated.POST("/auth/password/change", authHandler.ChangePassword)
 			authenticated.DELETE("/sessions/:id", authHandler.RevokeSessionByID)
@@ -280,6 +282,8 @@ func NewRouter(
 			authenticated.GET("/notifications", notificationHandler.ListNotifications)
 			authenticated.PATCH("/notifications/:id/read", notificationHandler.MarkRead)
 			authenticated.PATCH("/notifications/read-all", notificationHandler.MarkAllRead)
+			authenticated.POST("/notifications/bulk-archive", notificationHandler.BulkArchive)
+			authenticated.POST("/notifications/bulk-unarchive", notificationHandler.BulkUnarchive)
 			authenticated.PUT("/notifications/preferences", notificationHandler.UpdatePreferences)
 
 			// Savings goals
