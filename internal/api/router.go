@@ -63,6 +63,7 @@ func NewRouter(
 	referralHandler *handler.ReferralHandler,
 	consentHandler *handler.ConsentHandler,
 	adminJobQueueHandler *handler.AdminJobQueueHandler,
+	adminIndexerHandler *handler.AdminIndexerHandler,
 	webhookRepo webhook.WebhookRepository,
 	yellowCardWebhookHandler *handler.YellowCardWebhookHandler,
 	jwtPublicKey []byte,
@@ -88,6 +89,12 @@ func NewRouter(
 	r.Use(middleware.LoggingMiddleware())
 	r.Use(middleware.CORSMiddleware(cfg.CORS))
 	r.Use(middleware.PrometheusMiddleware())
+
+	// Request body cap (#445). Mounted after CORS so a 413 still carries the
+	// CORS headers browsers need, and after Prometheus so rejected requests
+	// are still counted. It runs ahead of auth and rate limiting, so an
+	// oversized payload is discarded before any expensive work happens.
+	r.Use(middleware.BodyLimit(cfg.Server.MaxBodyBytes, cfg.Server.MaxBodyBytesRoutes))
 
 	// Prometheus metrics endpoint — protected by admin API key (primary + secondary for zero-downtime rotation), un-rate-limited
 	r.GET("/metrics", middleware.AdminAPIKeyMiddleware(cfg.Auth.AdminAPIKey, cfg.Auth.AdminAPIKeySecondary), gin.WrapH(promhttp.Handler()))
@@ -160,6 +167,8 @@ func NewRouter(
 		requireIdem := middleware.RequireIdempotencyKey()
 		{
 			authenticated.GET("/me", authHandler.Me)
+			authenticated.PATCH("/me", userHandler.UpdateProfile)
+			authenticated.PATCH("/users/me", userHandler.UpdateProfile)
 			authenticated.POST("/auth/logout", authHandler.Logout)
 			authenticated.POST("/auth/password/change", authHandler.ChangePassword)
 			authenticated.DELETE("/sessions/:id", authHandler.RevokeSessionByID)
@@ -272,8 +281,11 @@ func NewRouter(
 			authenticated.GET("/users/me/communities", communityHandler.GetMyCommunities)
 
 			authenticated.GET("/notifications", notificationHandler.ListNotifications)
+			authenticated.GET("/notifications/search", notificationHandler.SearchNotifications)
 			authenticated.PATCH("/notifications/:id/read", notificationHandler.MarkRead)
 			authenticated.PATCH("/notifications/read-all", notificationHandler.MarkAllRead)
+			authenticated.POST("/notifications/bulk-archive", notificationHandler.BulkArchive)
+			authenticated.POST("/notifications/bulk-unarchive", notificationHandler.BulkUnarchive)
 			authenticated.PUT("/notifications/preferences", notificationHandler.UpdatePreferences)
 
 			// Savings goals
@@ -307,8 +319,13 @@ func NewRouter(
 
 		admin := authenticated.Group("/admin")
 		admin.Use(middleware.AdminMiddleware())
+		admin.Use(perResource(redisClient, "admin", cfg.RateLimit.AdminLimit, cfg.RateLimit.AdminWindowSeconds))
 		{
 			admin.GET("/users", adminHandler.ListUsers)
+		// Registered before any /users/:id route so the static "deleted" segment
+		// is not captured by a wildcard parameter.
+		admin.GET("/users/deleted", adminHandler.ListDeletedUsers)
+		admin.POST("/users/:id/restore", adminHandler.RestoreUser)
 			admin.GET("/circles", adminHandler.ListCircles)
 			admin.GET("/circles/:id/inspect", adminHandler.InspectCircleState)
 			admin.GET("/audit-log", adminHandler.GetAuditLog)
@@ -319,6 +336,8 @@ func NewRouter(
 			admin.DELETE("/feature-flags/:flag", adminHandler.DeleteFeatureFlag)
 			admin.GET("/jobs/dead-letter", adminJobQueueHandler.GetDeadLetterJobs)
 			admin.POST("/jobs/dead-letter/:id/retry", adminJobQueueHandler.RetryDeadLetterJob)
+			admin.GET("/indexer/dead-letter", adminIndexerHandler.GetDeadLetterEvents)
+			admin.POST("/indexer/dead-letter/:id/resolve", adminIndexerHandler.ResolveDeadLetterEvent)
 		}
 
 		optional := api.Group("")

@@ -27,6 +27,9 @@ type Engine struct {
 	processor   *EventProcessor
 	reconciler  *Reconciler
 	dedup       *Deduplicator
+	// deadLetters records events that could not be processed so the failure is
+	// recoverable rather than silently dropped (#349).
+	deadLetters DeadLetterStore
 	wg          sync.WaitGroup
 	stopCh      chan struct{}
 	metrics     *IndexerMetrics
@@ -46,6 +49,7 @@ func NewEngine(
 	metrics := NewIndexerMetrics()
 	if processor != nil {
 		processor.unknownEvents = metrics.UnknownContractEvents
+		processor.versionUnknown = metrics.ContractVersionUnknown
 		processor.SetEventCounters(metrics.Events)
 		if poller != nil {
 			processor.SetKnownContracts(poller.ContractIDs())
@@ -61,6 +65,7 @@ func NewEngine(
 		processor:   processor,
 		reconciler:  reconciler,
 		dedup:       NewDeduplicator(24 * time.Hour),
+		deadLetters: NewDeadLetterStore(db),
 		stopCh:      make(chan struct{}),
 		metrics:     metrics,
 	}
@@ -121,6 +126,44 @@ func (e *Engine) runPollLoop(ctx context.Context) {
 	}
 }
 
+// DeadLetter is called when an event cannot be processed. Recording the
+// failure is what makes it recoverable: without it the cursor advances past
+// the ledger, the deduplicator already holds the hash, and the event is lost
+// with no trace (#349). A nil store disables the behaviour.
+func (e *Engine) deadLetter(ctx context.Context, txn *Transaction, cause error) {
+	if e.deadLetters == nil {
+		return
+	}
+
+	payload, err := MarshalPayload(txn)
+	if err != nil {
+		// A payload we cannot serialise must not stop the failure being
+		// recorded; the hash and error are the parts that matter for triage.
+		log.Warn().Err(err).Str("hash", txn.Hash).Msg("serializing dead letter payload")
+	}
+
+	entry := &DeadLetterEntry{
+		Chain:    "stellar",
+		TxHash:   txn.Hash,
+		Ledger:   txn.Ledger,
+		Error:    cause.Error(),
+		Attempts: 1,
+		Payload:  payload,
+		Status:   "dead_letter",
+	}
+
+	if _, err := e.deadLetters.Record(ctx, entry); err != nil {
+		// Never let bookkeeping turn a recoverable per-event failure into a
+		// failed poll cycle: log loudly and carry on.
+		log.Error().Err(err).Str("hash", txn.Hash).Msg("recording dead letter failed")
+		return
+	}
+
+	if e.metrics != nil && e.metrics.DeadLettered != nil {
+		e.metrics.DeadLettered.Inc()
+	}
+}
+
 func (e *Engine) poll(ctx context.Context) error {
 	cursor, err := e.cursor.GetCurrent(ctx)
 	if err != nil {
@@ -147,15 +190,20 @@ func (e *Engine) poll(ctx context.Context) error {
 		}
 
 		filtered := e.poller.FilterByContract(txns)
-		for _, txn := range filtered {
+		for i := range filtered {
+			// Attach the ledger's close time so the processor can use it
+			// instead of time.Now() for consistent, ledger-ordered timestamps (#471).
+			filtered[i].LedgerCloseTime = ledger.ClosedAt
+			txn := &filtered[i]
 			if e.dedup.Has(txn.Hash) {
 				continue
 			}
 			e.dedup.Add(txn.Hash)
 
-			if err := e.processor.ProcessTransaction(ctx, &txn); err != nil {
+			if err := e.processor.ProcessTransaction(ctx, txn); err != nil {
 				log.Error().Err(err).Str("hash", txn.Hash).Msg("processing failed")
 				e.metrics.ProcessErrors.Inc()
+				e.deadLetter(ctx, &txn, err)
 				continue
 			}
 			processed++
