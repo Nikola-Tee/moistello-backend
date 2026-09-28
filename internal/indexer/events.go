@@ -1,5 +1,7 @@
 package indexer
 
+import "time"
+
 // Contract event type constants — must match the Symbol topics emitted by the
 // Soroban contracts (CircleFactory, Circle, ReputationRegistry, Treasury).
 const (
@@ -29,6 +31,22 @@ type ContractEvent struct {
 	Ledger int64 `json:"ledger"`
 	// TxHash is the transaction hash that produced this event.
 	TxHash string `json:"tx_hash"`
+	// LedgerCloseTime is the close time of the ledger containing this event,
+	// set by the processor from the transaction's ledger close time.
+	// Used instead of time.Now() to ensure timestamps follow ledger
+	// sequence ordering (#471).
+	LedgerCloseTime time.Time `json:"-"`
+	// ContractVersion is the executable (WASM) hash of the contract that emitted
+	// the event, recorded so an event stays attributable to the exact code that
+	// produced it across contract upgrades, which leave the contract ID
+	// unchanged. It is ContractVersionUnknown when the deployed version could
+	// not be resolved.
+	//
+	// Decoding leaves this empty: the version is not carried in the event XDR
+	// and is filled in by the processor when the event is recorded, so it is
+	// omitted from a decoded event's JSON rather than rendered as a misleading
+	// empty version.
+	ContractVersion string `json:"contract_version,omitempty"`
 	// Payload is a flat map of decoded XDR field names → Go-native values.
 	// Keys and value types match the typed payload structs below.
 	Payload map[string]any `json:"payload"`

@@ -18,6 +18,14 @@ type IndexerMetrics struct {
 	// ReorgsDetected counts ledger reorganizations that were detected and
 	// rolled back (#346).
 	ReorgsDetected prometheus.Counter
+	// DeadLettered counts events recorded in the indexer dead-letter queue
+	// because they could not be processed (#349).
+	DeadLettered prometheus.Counter
+	// ContractVersionUnknown counts events recorded with an unknown contract
+	// version because the deployed version could not be resolved. A sustained
+	// rate means version resolution is broken, and those rows are permanently
+	// unattributable to a contract version.
+	ContractVersionUnknown prometheus.Counter
 	// Events carries the per-event-type counters. It is nil only in tests that
 	// deliberately build a partial IndexerMetrics.
 	Events *EventCounters
@@ -157,6 +165,14 @@ func NewIndexerMetrics() *IndexerMetrics {
 		ReorgsDetected: promauto.NewCounter(prometheus.CounterOpts{
 			Name: "moistello_indexer_reorgs_detected_total",
 			Help: "Total ledger reorganizations detected and rolled back",
+		}),
+		DeadLettered: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "moistello_indexer_dead_lettered_total",
+			Help: "Total indexer events recorded in the dead-letter queue after a processing failure",
+		}),
+		ContractVersionUnknown: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "moistello_indexer_contract_version_unknown_total",
+			Help: "Total contract events recorded with an unknown contract version because the deployed version could not be resolved",
 		}),
 		Events: NewEventCounters(prometheus.DefaultRegisterer),
 	}
