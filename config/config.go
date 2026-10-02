@@ -233,6 +233,8 @@ type IndexerConfig struct {
 	// reaching past the window is reported rather than partially repaired
 	// (#346).
 	ReorgWindow int `mapstructure:"reorg_window"`
+	MaxCursorLag   time.Duration `mapstructure:"max_cursor_lag"`
+	StallThreshold time.Duration `mapstructure:"stall_threshold"`
 }
 
 type NotificationConfig struct {
@@ -370,6 +372,7 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "indexer.batch_size", 50)
 	setDefault(v, "indexer.max_cursor_lag", "2m")
 	setDefault(v, "indexer.reorg_window", 10)
+	setDefault(v, "indexer.stall_threshold", "5m")
 	setDefault(v, "cors.allowed_origins", []string{"http://localhost:1110"})
 	setDefault(v, "cors.allowed_methods", []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"})
 	setDefault(v, "cors.allowed_headers", []string{"Authorization", "Content-Type", "X-Request-ID"})
@@ -477,6 +480,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("indexer.batch_size", 50)
 	v.SetDefault("indexer.max_cursor_lag", "2m")
 	v.SetDefault("indexer.reorg_window", 10)
+	v.SetDefault("indexer.stall_threshold", "5m")
 	v.SetDefault("cors.allowed_origins", []string{"http://localhost:1110"})
 	v.SetDefault("cors.allowed_methods", []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"})
 	v.SetDefault("cors.allowed_headers", []string{"Authorization", "Content-Type", "X-Request-ID"})

@@ -91,6 +91,7 @@ indexer:
   # and rolled back: a fork at or below the window boundary is reported as
   # unrepairable rather than partially applied. <= 0 uses the 10 ledger default.
   reorg_window: 10
+  stall_threshold: "5m"
 
 notification:
   email:
