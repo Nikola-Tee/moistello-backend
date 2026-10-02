@@ -227,6 +227,14 @@ type IndexerConfig struct {
 	// MaxCursorLag is how long the cursor's last_processed_at may trail the
 	// current time before the health server reports the indexer as unhealthy.
 	MaxCursorLag time.Duration `mapstructure:"max_cursor_lag"`
+	// ReorgWindow is how many ledgers behind the cursor the reorg check
+	// inspects, and therefore how deep a reorganization can be detected and
+	// rolled back. Values <= 0 fall back to a 10 ledger default; a reorg
+	// reaching past the window is reported rather than partially repaired
+	// (#346).
+	ReorgWindow int `mapstructure:"reorg_window"`
+	MaxCursorLag   time.Duration `mapstructure:"max_cursor_lag"`
+	StallThreshold time.Duration `mapstructure:"stall_threshold"`
 }
 
 type NotificationConfig struct {
@@ -290,6 +298,8 @@ type RateLimitConfig struct {
 	PasswordResetIPLimit        int `mapstructure:"password_reset_ip_limit"`
 	PasswordResetAccountLimit   int `mapstructure:"password_reset_account_limit"`
 	PasswordResetWindowSeconds  int `mapstructure:"password_reset_window_seconds"`
+	AdminLimit                  int `mapstructure:"admin_limit"`
+	AdminWindowSeconds          int `mapstructure:"admin_window_seconds"`
 }
 
 type LoggingConfig struct {
@@ -361,6 +371,8 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "indexer.poll_interval", "3s")
 	setDefault(v, "indexer.batch_size", 50)
 	setDefault(v, "indexer.max_cursor_lag", "2m")
+	setDefault(v, "indexer.reorg_window", 10)
+	setDefault(v, "indexer.stall_threshold", "5m")
 	setDefault(v, "cors.allowed_origins", []string{"http://localhost:1110"})
 	setDefault(v, "cors.allowed_methods", []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"})
 	setDefault(v, "cors.allowed_headers", []string{"Authorization", "Content-Type", "X-Request-ID"})
@@ -380,6 +392,8 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "rate_limit.wallet_transfer_window_seconds", 60)
 	setDefault(v, "rate_limit.referral_limit", 10)
 	setDefault(v, "rate_limit.referral_window_seconds", 3600)
+	setDefault(v, "rate_limit.admin_limit", 50)
+	setDefault(v, "rate_limit.admin_window_seconds", 60)
 	setDefault(v, "logging.level", "debug")
 	setDefault(v, "logging.format", "json")
 	setDefault(v, "logging.output", "stdout")
@@ -465,6 +479,8 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("indexer.poll_interval", "3s")
 	v.SetDefault("indexer.batch_size", 50)
 	v.SetDefault("indexer.max_cursor_lag", "2m")
+	v.SetDefault("indexer.reorg_window", 10)
+	v.SetDefault("indexer.stall_threshold", "5m")
 	v.SetDefault("cors.allowed_origins", []string{"http://localhost:1110"})
 	v.SetDefault("cors.allowed_methods", []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"})
 	v.SetDefault("cors.allowed_headers", []string{"Authorization", "Content-Type", "X-Request-ID"})

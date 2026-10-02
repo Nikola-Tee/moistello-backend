@@ -1,5 +1,7 @@
 package indexer
 
+import "time"
+
 // Contract event type constants — must match the Symbol topics emitted by the
 // Soroban contracts (CircleFactory, Circle, ReputationRegistry, Treasury).
 const (
@@ -29,6 +31,11 @@ type ContractEvent struct {
 	Ledger int64 `json:"ledger"`
 	// TxHash is the transaction hash that produced this event.
 	TxHash string `json:"tx_hash"`
+	// LedgerCloseTime is the close time of the ledger containing this event,
+	// set by the processor from the transaction's ledger close time.
+	// Used instead of time.Now() to ensure timestamps follow ledger
+	// sequence ordering (#471).
+	LedgerCloseTime time.Time `json:"-"`
 	// ContractVersion is the executable (WASM) hash of the contract that emitted
 	// the event, recorded so an event stays attributable to the exact code that
 	// produced it across contract upgrades, which leave the contract ID
