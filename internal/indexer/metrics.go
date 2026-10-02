@@ -15,6 +15,9 @@ type IndexerMetrics struct {
 	DedupSize             prometheus.Gauge
 	CursorLagSeconds      prometheus.Gauge
 	UnknownContractEvents prometheus.Counter
+	// DeadLettered counts events recorded in the indexer dead-letter queue
+	// because they could not be processed (#349).
+	DeadLettered prometheus.Counter
 	// ContractVersionUnknown counts events recorded with an unknown contract
 	// version because the deployed version could not be resolved. A sustained
 	// rate means version resolution is broken, and those rows are permanently
@@ -155,6 +158,10 @@ func NewIndexerMetrics() *IndexerMetrics {
 		UnknownContractEvents: promauto.NewCounter(prometheus.CounterOpts{
 			Name: "moistello_indexer_unknown_contract_events_total",
 			Help: "Total contract events skipped because they came from an unknown contract",
+		}),
+		DeadLettered: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "moistello_indexer_dead_lettered_total",
+			Help: "Total indexer events recorded in the dead-letter queue after a processing failure",
 		}),
 		ContractVersionUnknown: promauto.NewCounter(prometheus.CounterOpts{
 			Name: "moistello_indexer_contract_version_unknown_total",

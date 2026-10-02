@@ -226,7 +226,8 @@ type IndexerConfig struct {
 	StartLedger  int64         `mapstructure:"start_ledger"`
 	// MaxCursorLag is how long the cursor's last_processed_at may trail the
 	// current time before the health server reports the indexer as unhealthy.
-	MaxCursorLag time.Duration `mapstructure:"max_cursor_lag"`
+	MaxCursorLag   time.Duration `mapstructure:"max_cursor_lag"`
+	StallThreshold time.Duration `mapstructure:"stall_threshold"`
 }
 
 type NotificationConfig struct {
@@ -290,6 +291,8 @@ type RateLimitConfig struct {
 	PasswordResetIPLimit        int `mapstructure:"password_reset_ip_limit"`
 	PasswordResetAccountLimit   int `mapstructure:"password_reset_account_limit"`
 	PasswordResetWindowSeconds  int `mapstructure:"password_reset_window_seconds"`
+	AdminLimit                  int `mapstructure:"admin_limit"`
+	AdminWindowSeconds          int `mapstructure:"admin_window_seconds"`
 }
 
 type LoggingConfig struct {
@@ -361,6 +364,7 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "indexer.poll_interval", "3s")
 	setDefault(v, "indexer.batch_size", 50)
 	setDefault(v, "indexer.max_cursor_lag", "2m")
+	setDefault(v, "indexer.stall_threshold", "5m")
 	setDefault(v, "cors.allowed_origins", []string{"http://localhost:1110"})
 	setDefault(v, "cors.allowed_methods", []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"})
 	setDefault(v, "cors.allowed_headers", []string{"Authorization", "Content-Type", "X-Request-ID"})
@@ -380,6 +384,8 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "rate_limit.wallet_transfer_window_seconds", 60)
 	setDefault(v, "rate_limit.referral_limit", 10)
 	setDefault(v, "rate_limit.referral_window_seconds", 3600)
+	setDefault(v, "rate_limit.admin_limit", 50)
+	setDefault(v, "rate_limit.admin_window_seconds", 60)
 	setDefault(v, "logging.level", "debug")
 	setDefault(v, "logging.format", "json")
 	setDefault(v, "logging.output", "stdout")
@@ -419,6 +425,7 @@ func Load(path string) (*Config, error) {
 	mustBindEnv(v, "yellow_card.api_key", "YELLOW_CARD_API_KEY")
 	mustBindEnv(v, "yellow_card.api_secret", "YELLOW_CARD_API_SECRET")
 	mustBindEnv(v, "yellow_card.webhook_secret", "YELLOW_CARD_WEBHOOK_SECRET")
+	mustBindEnv(v, "cors.allowed_origins", "MOISTELLO_CORS_ALLOWED_ORIGINS", "ALLOWED_ORIGINS")
 	mustBindEnv(v, "redis.url", "MOISTELLO_REDIS_URL", "REDIS_URL")
 	mustBindEnv(v, "redis.password", "MOISTELLO_REDIS_PASSWORD", "REDIS_PASSWORD")
 	mustBindEnv(v, "auth.admin_api_key", "MOISTELLO_AUTH_ADMIN_API_KEY", "ADMIN_API_KEY")
@@ -465,6 +472,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("indexer.poll_interval", "3s")
 	v.SetDefault("indexer.batch_size", 50)
 	v.SetDefault("indexer.max_cursor_lag", "2m")
+	v.SetDefault("indexer.stall_threshold", "5m")
 	v.SetDefault("cors.allowed_origins", []string{"http://localhost:1110"})
 	v.SetDefault("cors.allowed_methods", []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"})
 	v.SetDefault("cors.allowed_headers", []string{"Authorization", "Content-Type", "X-Request-ID"})
@@ -555,6 +563,11 @@ func Load(path string) (*Config, error) {
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config errors:\n - %s", strings.Join(errs, "\n - "))
 	}
+
+	// CORS policy is environment specific (#348): resolve the allowed origins
+	// and refuse combinations that would silently break the browser handshake.
+	cfg.CORS.AllowedOrigins = ResolveCORSAllowedOrigins(cfg.CORS.AllowedOrigins, cfg.Environment)
+	validateCORS(cfg.Environment, cfg.CORS)
 
 	cfg.Hot = NewHotReloader(&cfg)
 

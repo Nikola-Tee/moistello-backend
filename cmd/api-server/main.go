@@ -51,6 +51,7 @@ import (
 	"github.com/moistello/backend/internal/domain/token"
 	"github.com/moistello/backend/internal/domain/totp"
 	"github.com/moistello/backend/internal/domain/user"
+	"github.com/moistello/backend/internal/indexer"
 	"github.com/moistello/backend/internal/domain/verification"
 	"github.com/moistello/backend/internal/domain/wallet"
 	"github.com/moistello/backend/internal/domain/withdrawal"
@@ -470,8 +471,9 @@ func main() {
 	// Job queue for background tasks
 	jobQueue := jobqueue.NewJobQueue(db)
 	adminJobQueueH := handler.NewAdminJobQueueHandler(jobQueue)
+	adminIndexerH := handler.NewAdminIndexerHandler(indexer.NewDeadLetterStore(db))
 
-	router := api.NewRouter(cfg, redisClient, authH, userH, circleH, contribH, payoutH, inviteH, notifH, adminH, webhookH, healthH, passkeyCredH, walletH, depositH, mobileMoneyH, chatH, communityH, wsH, savingsH, tokenH, swapH, governanceH, reputationH, referralH, consentH, adminJobQueueH, webhookRepo, ycWebhookH, jwtPublicKey)
+	router := api.NewRouter(cfg, redisClient, authH, userH, circleH, contribH, payoutH, inviteH, notifH, adminH, webhookH, healthH, passkeyCredH, walletH, depositH, mobileMoneyH, chatH, communityH, wsH, savingsH, tokenH, swapH, governanceH, reputationH, referralH, consentH, adminJobQueueH, adminIndexerH, webhookRepo, ycWebhookH, jwtPublicKey)
 
 	// Shutdown order: fail readiness first so the load balancer stops sending
 	// traffic, drain in-flight HTTP requests (bounded by
